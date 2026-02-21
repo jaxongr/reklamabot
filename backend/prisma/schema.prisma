@@ -1,0 +1,546 @@
+// Telegram Reklama Bot - Prisma Schema
+// PostgreSQL Database Schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================
+// USER & AUTH
+// ============================================================
+
+model User {
+  id            String    @id @default(cuid())
+  telegramId    String    @unique
+  username      String?
+  firstName     String?
+  lastName      String?
+  phoneNumber   String?
+  language      String    @default("uz")
+  timezone       String    @default("Asia/Tashkent")
+  role          UserRole  @default(USER)
+  status        UserStatus @default(ACTIVE)
+  isActive      Boolean   @default(true)
+
+  // Subscription
+  subscription      Subscription?
+
+  // Relations
+  payments         Payment[]
+  sessions         Session[]
+  ads             Ad[]
+  posts           Post[]
+  postHistories   PostHistory[]
+  subscriptionHistories SubscriptionHistory[]
+  createdAds      Ad[]       @relation("CreatedBy")
+  closedAds       Ad[]       @relation("ClosedBy")
+
+  // Brand ad
+  brandAdText    String?    @db.Text
+  brandAdEnabled Boolean   @default(false)
+
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+
+  @@index([telegramId])
+  @@index([role])
+  @@index([status])
+}
+
+enum UserRole {
+  USER
+  ADMIN
+  DISPATCHER
+  SUPER_ADMIN
+}
+
+enum UserStatus {
+   ACTIVE
+  SUSPENDED
+  BANNED
+}
+
+// ============================================================
+// SUBSCRIPTION & PAYMENT
+// ============================================================
+
+model Subscription {
+  id              String    @id @default(cuid())
+  userId          String    @unique
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  planType        SubscriptionPlan
+  status          SubscriptionStatus
+
+  startDate       DateTime
+  endDate         DateTime?
+
+  autoRenew       Boolean   @default(false)
+
+  // Posting limits
+  maxAds          Int       @default(10)
+  maxSessions     Int       @default(1)
+  maxGroups       Int       @default(100)
+
+  // Intervals (in seconds)
+  minInterval     Int       @default(300)  // 5 min
+  maxInterval     Int       @default(900)  // 15 min
+  groupInterval   Int       @default(3)  // 0.5-5 sec
+
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+
+  @@index([userId])
+  @@index([status])
+}
+
+enum SubscriptionPlan {
+  STARTER
+  BUSINESS
+  PREMIUM
+  ENTERPRISE
+}
+
+enum SubscriptionStatus {
+   ACTIVE
+  EXPIRED
+   CANCELLED
+   PENDING
+}
+
+model SubscriptionHistory {
+  id              String    @id @default(cuid())
+  userId          String
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  planType        SubscriptionPlan
+  status          SubscriptionStatus
+  startDate       DateTime
+  endDate         DateTime?
+  amount          Float
+  currency        String    @default("UZS")
+
+  createdAt       DateTime   @default(now())
+
+  @@index([userId])
+}
+
+model Payment {
+  id              String    @id @default(cuid())
+  userId          String
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  amount          Float
+  currency        String    @default("UZS")
+  status          PaymentStatus
+
+  // Payment proof
+  cardNumber      String?
+  receiptImage    String?
+  transactionId   String?
+
+  planType        SubscriptionPlan?
+
+  // Admin verification
+  verifiedBy      String?
+  verifiedAt      DateTime?
+  rejectReason    String?
+
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+
+  @@index([userId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+enum PaymentStatus {
+   PENDING
+  APPROVED
+  REJECTED
+  EXPIRED
+}
+
+// ============================================================
+// SESSION & GROUPS
+// ============================================================
+
+model Session {
+  id              String    @id @default(cuid())
+  userId          String
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  name            String?
+  status          SessionStatus @default(ACTIVE)
+
+  // Telegram session data
+  phone           String?
+  sessionString   String?   @db.Text
+  isPremium       Boolean   @default(false)
+
+  // Statistics
+  totalGroups     Int       @default(0)
+  activeGroups    Int       @default(0)
+  lastSyncAt      DateTime?
+
+  // Freeze protection
+  isFrozen        Boolean   @default(false)
+  frozenAt        DateTime?
+  unfreezeAt      DateTime?
+  freezeCount     Int       @default(0)
+
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+
+  // Relations
+  groups          Group[]
+  posts           Post[]
+
+  @@index([userId])
+  @@index([status])
+  @@index([isFrozen])
+}
+
+enum SessionStatus {
+   ACTIVE
+  INACTIVE
+  FROZEN
+  BANNED
+  DELETED
+}
+
+model Group {
+  id              String    @id @default(cuid())
+  sessionId       String
+  session         Session   @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  // Telegram data
+  telegramId      String    @unique
+  title           String
+  username        String?
+  type            GroupType
+  memberCount     Int?
+
+  // Posting restrictions
+  hasRestrictions Boolean   @default(false)
+  restrictionUntil DateTime?
+
+  // Group activity
+  isActive        Boolean   @default(true)
+  activityScore   Float     @default(0)
+  lastPostAt      DateTime?
+
+  // Manual invite required
+  requiresInvite  Boolean   @default(false)
+
+  // Skip during posting
+  skipReason      String?
+  isSkipped       Boolean   @default(false)
+
+  // Priority (top 50 active groups)
+  isPriority      Boolean   @default(false)
+  priorityOrder   Int?
+
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+
+  // Relations
+  postHistories   PostHistory[]
+
+  @@index([sessionId])
+  @@index([telegramId])
+  @@index([isPriority])
+  @@index([activityScore])
+  @@unique([sessionId, telegramId])
+}
+
+enum GroupType {
+  GROUP
+  SUPERGROUP
+  CHANNEL
+}
+
+// ============================================================
+// ADS & POSTS
+// ============================================================
+
+model Ad {
+  id              String    @id @default(cuid())
+  userId          String
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Ad content
+  title           String
+  description     String?   @db.Text
+  content         String    @db.Text
+  mediaUrls       String[]
+  mediaType       MediaType
+
+  // Ad status
+  status          AdStatus  @default(DRAFT)
+
+  // Pricing
+  price           Float?
+  currency        String    @default("UZS")
+  negotiable      Boolean   @default(false)
+
+  // Sale tracking
+  totalQuantity   Int?
+  soldQuantity    Int       @default(0)
+  isSold          Boolean   @default(false)
+  soldAt          DateTime?
+  closedReason    String?
+
+  // Branding
+  brandAdEnabled  Boolean   @default(false)
+  brandAdText     String?   @db.Text
+
+  // Display settings
+  displayNumber   Int?
+
+  // Combination
+  combineWithAds  String[]
+
+  // Distribution settings
+  selectedGroups String[]
+
+  intervalMin     Int       @default(300)   // 5 min
+  intervalMax     Int       @default(900)   // 15 min
+  groupInterval  Int       @default(3)  // 0.5-5 sec
+
+  isPriority      Boolean   @default(false)
+
+  // Statistics
+  viewCount      Int       @default(0)
+  clickCount     Int       @default(0)
+  shareCount     Int       @default(0)
+
+  // Creator tracking
+  createdBy       String
+  creator         User       @relation("CreatedBy", fields: [createdBy], references: [id], onDelete: Cascade)
+  closedBy        String?
+  closer          User?      @relation("ClosedBy", fields: [closedBy], references: [id], onDelete: Cascade)
+
+  // Scheduling
+  scheduledFor    DateTime?
+  isScheduled    Boolean   @default(false)
+  lastScheduledAt DateTime?
+  lastError       String?
+
+  // Session assignment (for posting)
+  sessionId       String?
+
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+
+  // Relations
+  posts           Post[]
+  statistics       AdStatistics?
+
+  @@index([userId])
+  @@index([status])
+  @@index([isPriority])
+  @@index([scheduledFor])
+  @@index([createdAt])
+}
+
+enum MediaType {
+  TEXT
+  PHOTO
+  VIDEO
+  DOCUMENT
+  ALBUM
+}
+
+enum AdStatus {
+   DRAFT
+   ACTIVE
+   PAUSED
+   CLOSED
+   SOLD_OUT
+   ARCHIVED
+}
+
+model Post {
+  id              String    @id @default(cuid())
+  adId            String
+  ad              Ad       @relation(fields: [adId], references: [id], onDelete: Cascade)
+
+  userId          String
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  sessionId       String
+  session         Session   @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  // Post status
+  status          PostStatus @default(PENDING)
+
+  // Distribution
+  totalGroups     Int
+  completedGroups Int       @default(0)
+  failedGroups    Int       @default(0)
+  skippedGroups   Int       @default(0)
+
+  // Timing
+  startedAt       DateTime?
+  completedAt     DateTime?
+  pausedAt        DateTime?
+
+  // Last sent message ID (for resuming)
+  lastMessageId  Int?
+  lastGroupIndex Int       @default(0)
+
+  // Error tracking
+  lastError      String?
+  errorCount     Int       @default(0)
+
+  // Auto-restart
+  canRestart      Boolean   @default(true)
+  lastPausedAt   DateTime?
+
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+
+  // Relations
+  histories       PostHistory[]
+
+  @@index([adId])
+  @@index([userId])
+  @@index([sessionId])
+  @@index([status])
+  @@index([startedAt])
+}
+
+enum PostStatus {
+   PENDING
+   IN_PROGRESS
+   PAUSED
+   COMPLETED
+   FAILED
+   CANCELLED
+}
+
+model PostHistory {
+  id              String    @id @default(cuid())
+  postId          String
+  post            Post     @relation(fields: [postId], references: [id], onDelete: Cascade)
+
+  groupId         String
+  group           Group    @relation(fields: [groupId], references: [id], onDelete: Cascade)
+
+  userId          String
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Message details
+  messageId       Int?
+  status          DeliveryStatus
+
+  // Timestamps
+  sentAt          DateTime?
+  failedAt        DateTime?
+
+  // Error details
+  errorCode       String?
+  errorMessage    String?
+
+  createdAt       DateTime   @default(now())
+
+  @@index([postId])
+  @@index([groupId])
+  @@index([status])
+}
+
+enum DeliveryStatus {
+   PENDING
+  SENT
+   FAILED
+   SKIPPED
+   RETRYING
+}
+
+// ============================================================
+// ANALYTICS & STATISTICS
+// ============================================================
+
+model AdStatistics {
+  id              String    @id @default(cuid())
+  adId            String    @unique
+  ad              Ad       @relation(fields: [adId], references: [id], onDelete: Cascade)
+
+  // Daily stats
+  date            DateTime  @db.Date
+  views           Int       @default(0)
+  clicks          Int       @default(0)
+  shares          Int       @default(0)
+
+  // Engagement
+  engagementRate Float     @default(0)
+
+  // Conversion
+  conversions      Int       @default(0)
+  conversionRate Float     @default(0)
+
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+
+  @@index([adId])
+  @@index([date])
+}
+
+model SystemStatistics {
+  id              String    @id @default(cuid())
+  date            DateTime  @db.Date
+
+  // User stats
+  totalUsers      Int       @default(0)
+  activeUsers     Int       @default(0)
+  newUsers        Int       @default(0)
+
+  // Ad stats
+  totalAds        Int       @default(0)
+  activeAds       Int       @default(0)
+  closedAds       Int       @default(0)
+
+  // Post stats
+  totalPosts      Int       @default(0)
+  successfulPosts Int       @default(0)
+  failedPosts     Int       @default(0)
+
+  // Revenue
+  totalRevenue    Float     @default(0)
+  pendingRevenue  Float     @default(0)
+
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+
+  @@index([date])
+}
+
+// ============================================================
+// SETTINGS & CONFIGURATION
+// ============================================================
+
+model SystemConfig {
+  id              String    @id @default(cuid())
+  key             String    @unique
+  value           String    @db.Text
+  type            ConfigType
+  description     String?
+
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+
+  @@index([key])
+}
+
+enum ConfigType {
+  STRING
+  NUMBER
+  BOOLEAN
+  JSON
+}

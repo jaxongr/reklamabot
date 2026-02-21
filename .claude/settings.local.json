@@ -1,0 +1,42 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx @nestjs/cli@latest new backend --package-manager npm --skip-git --strict:*)",
+      "Bash(npm install:*)",
+      "Bash(npx prisma init:*)",
+      "Bash(npx nest g module:*)",
+      "Bash(npx nest g service:*)",
+      "Bash(npx nest g controller:*)",
+      "Bash(npm create:*)",
+      "Bash(npm run dev)",
+      "Bash(npm run start:dev:*)",
+      "Bash(npx prisma generate:*)",
+      "Bash(curl:*)",
+      "Bash(python3:*)",
+      "Bash(iconv:*)",
+      "Bash(git checkout:*)",
+      "Bash(node:*)",
+      "Bash(findstr:*)",
+      "Bash(npx tsc:*)",
+      "Bash(npm run build:*)",
+      "Bash(timeout 30 npm run build:*)",
+      "Bash(echo:*)",
+      "Bash(find:*)",
+      "Bash(docker:*)",
+      "Bash(docker-compose up:*)",
+      "Bash(Get-Content:*)",
+      "Bash(netstat:*)",
+      "Bash(taskkill:*)",
+      "Bash(powershell:*)",
+      "Bash(ping:*)",
+      "Bash(tail:*)",
+      "Bash(pg_isready:*)",
+      "Bash(redis-cli ping:*)",
+      "Bash(\"/c/Program Files/PostgreSQL/16/bin/psql.exe\":*)",
+      "Bash(\"/c/Program Files/PostgreSQL/16/bin/psql.exe\" -U postgres -c \"CREATE USER reklama_user WITH PASSWORD 'reklama_password';\" 2>&1 && \"/c/Program Files/PostgreSQL/16/bin/psql.exe\" -U postgres -c \"CREATE DATABASE reklama_bot OWNER reklama_user;\" 2>&1 && \"/c/Program Files/PostgreSQL/16/bin/psql.exe\" -U postgres -c \"GRANT ALL PRIVILEGES ON DATABASE reklama_bot TO reklama_user;\" 2>&1)",
+      "Bash(cd \"D:/Loyixalar/Reklama bot/backend\" && npx prisma migrate dev --name init 2>&1)",
+      "Bash(head:*)",
+      "Bash(cd \"D:/Loyixalar/Reklama bot\" && git add backend/ dashboard/ CLAUDE.md .gitignore .claude/ 2>&1)"
+    ]
+  }
+}

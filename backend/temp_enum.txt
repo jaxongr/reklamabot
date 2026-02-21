@@ -1,0 +1,9 @@
+
+enum AdStatus {
+  DRAFT
+  ACTIVE
+  PAUSED
+  CLOSED
+  SOLD_OUT
+  ARCHIVED
+}
