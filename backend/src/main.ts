@@ -1,13 +1,18 @@
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe } from '@nestjs/common';
 import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
+import { NestExpressApplication } from '@nestjs/platform-express';
+import { join } from 'path';
 import { AppModule } from './app.module';
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+  const app = await NestFactory.create<NestExpressApplication>(AppModule);
 
   // Global prefix
   app.setGlobalPrefix('api/v1');
+
+  // Static assets — chek rasmlari uchun
+  app.useStaticAssets(join(process.cwd(), 'uploads'), { prefix: '/uploads' });
 
   // CORS
   app.enableCors({
@@ -38,6 +43,8 @@ async function bootstrap() {
     .addTag('ads', 'Advertisement Management')
     .addTag('posts', 'Post Distribution')
     .addTag('analytics', 'Statistics & Analytics')
+    .addTag('config', 'System Configuration')
+    .addTag('upload', 'File Upload')
     .addBearerAuth()
     .build();
 

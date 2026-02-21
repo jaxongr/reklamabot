@@ -1,12 +1,12 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../common/prisma.service';
-import { ConfigService } from '@nestjs/config';
 import { TelegramService } from '../telegram/telegram.service';
 
 interface PostingJob {
   id: string;
   adId: string;
   adContent: string;
+  userId: string;
   status: 'running' | 'paused' | 'stopped' | 'completed';
   startTime: Date;
   endTime?: Date;
@@ -23,6 +23,7 @@ interface PostingJob {
 interface PostingLog {
   timestamp: Date;
   sessionId: string;
+  sessionName: string;
   groupName: string;
   groupId: string;
   status: 'success' | 'failed' | 'skipped';
@@ -32,36 +33,49 @@ interface PostingLog {
 
 interface GroupInfo {
   id: string;
+  telegramId: string;
   name: string;
   sessionId: string;
-  lastAdPosted?: Date;
-  skipReason?: string;
+  sessionName: string;
 }
+
+// Roundlar orasidagi pauza (10 daqiqa)
+const ROUND_PAUSE_MS = 10 * 60 * 1000;
+
+// Guruhlar orasidagi random delay (0.5 — 5 soniya)
+const MIN_GROUP_DELAY_MS = 500;
+const MAX_GROUP_DELAY_MS = 5000;
 
 @Injectable()
 export class PostingService {
   private readonly logger = new Logger(PostingService.name);
   private activeJobs = new Map<string, PostingJob>();
-  private postingIntervals = new Map<string, NodeJS.Timeout>();
+  private jobTimers = new Map<string, NodeJS.Timeout>();
 
   constructor(
     private readonly prisma: PrismaService,
-    private readonly config: ConfigService,
     private readonly telegramService: TelegramService,
   ) {}
 
   /**
-   * Start posting ad to all groups from all sessions
+   * Foydalanuvchining barcha sessionlaridagi guruhlarga e'lon tarqatishni boshlash
    */
   async startPosting(adId: string, adContent: string, userId: string): Promise<PostingJob> {
-    // Get all active sessions with their groups
+    // Foydalanuvchining FAOL sessionlarini olish (faqat uning sessionlari)
     const sessions = await this.prisma.session.findMany({
       where: {
+        userId,
         status: 'ACTIVE',
         isFrozen: false,
+        sessionString: { not: null },
       },
       include: {
-        groups: true,
+        groups: {
+          where: {
+            isActive: true,
+            isSkipped: false,
+          },
+        },
       },
     });
 
@@ -69,30 +83,60 @@ export class PostingService {
       throw new Error('Faol session topilmadi. Iltimos, avval session ulang.');
     }
 
-    // Collect all groups
+    // Ulangan sessionlarni tekshirish
+    const connectedSessions = sessions.filter(s =>
+      this.telegramService.isClientConnected(s.id),
+    );
+
+    if (connectedSessions.length === 0) {
+      // Ulashga harakat qilamiz
+      for (const session of sessions) {
+        try {
+          await this.telegramService.connectSession(session.id);
+        } catch (error) {
+          this.logger.warn(`Session ulanmadi: ${session.id} — ${error.message}`);
+        }
+      }
+
+      const retryConnected = sessions.filter(s =>
+        this.telegramService.isClientConnected(s.id),
+      );
+
+      if (retryConnected.length === 0) {
+        throw new Error('Hech bir session ulanmadi. Sessionlarni tekshiring.');
+      }
+    }
+
+    // Barcha ulangan sessionlardagi guruhlarni yig'ish
     const allGroups: GroupInfo[] = [];
     for (const session of sessions) {
+      if (!this.telegramService.isClientConnected(session.id)) continue;
+
       for (const group of session.groups) {
         allGroups.push({
           id: group.id,
-          name: group.title || 'Unknown',
+          telegramId: group.telegramId,
+          name: group.title || 'Nomsiz',
           sessionId: session.id,
-          lastAdPosted: group.lastPostAt,
-          skipReason: this.shouldSkipGroup(group),
+          sessionName: session.name || session.phone || 'Session',
         });
       }
     }
 
     if (allGroups.length === 0) {
-      throw new Error('Guruhlar topilmadi. Iltimos, avval guruhlarni sinxronlang.');
+      throw new Error(
+        `${sessions.length} ta session bor, lekin guruhlar topilmadi. ` +
+        'Avval guruhlarni sinxronlang.',
+      );
     }
 
-    // Create job
-    const jobId = `job_${Date.now()}`;
+    // Job yaratish
+    const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const job: PostingJob = {
       id: jobId,
       adId,
       adContent,
+      userId,
       status: 'running',
       startTime: new Date(),
       totalGroups: allGroups.length,
@@ -107,218 +151,191 @@ export class PostingService {
 
     this.activeJobs.set(jobId, job);
 
-    // Start posting in background
-    this.runPostingJob(jobId, allGroups);
+    this.logger.log(
+      `Tarqatish boshlandi: ${jobId} — ` +
+      `${connectedSessions.length} session, ${allGroups.length} guruh`,
+    );
+
+    // Background da ishga tushirish
+    this.runPostingLoop(jobId, allGroups);
 
     return job;
   }
 
   /**
-   * Determine if a group should be skipped
+   * Asosiy tarqatish tsikli: round → 10 min pauza → round → ...
    */
-  private shouldSkipGroup(group: any): string | undefined {
-    // Skip if marked as skipped
-    if (group.isSkipped) {
-      return group.skipReason || 'Skip qilingan';
-    }
-
-    // Skip if group is inactive
-    if (group.isActive === false) {
-      return 'Guruh nofaol';
-    }
-
-    // Skip if recently posted (within 24 hours)
-    if (group.lastPostAt) {
-      const hoursSinceLastPost = (Date.now() - group.lastPostAt.getTime()) / (1000 * 60 * 60);
-      if (hoursSinceLastPost < 24) {
-        return `So'nggi ${Math.floor(hoursSinceLastPost)} soat oldin e'lon yuborilgan`;
-      }
-    }
-
-    return undefined;
-  }
-
-  /**
-   * Run posting job with delays and rounds
-   */
-  private async runPostingJob(jobId: string, groups: GroupInfo[]): Promise<void> {
+  private async runPostingLoop(jobId: string, groups: GroupInfo[]): Promise<void> {
     const job = this.activeJobs.get(jobId);
     if (!job) return;
 
-    this.logger.log(`Starting posting job ${jobId} for ${groups.length} groups`);
-
-    // Shuffle groups for random order
-    const shuffledGroups = this.shuffleArray([...groups]);
-
-    // First round
-    await this.postRound(job, shuffledGroups);
-
-    // Continue with rounds if not stopped
-    const interval = setInterval(async () => {
-      const currentJob = this.activeJobs.get(jobId);
-      if (!currentJob || currentJob.status === 'stopped') {
-        clearInterval(interval);
-        this.postingIntervals.delete(jobId);
-        return;
-      }
-
-      if (currentJob.stopRequested) {
-        currentJob.status = 'stopped';
-        currentJob.endTime = new Date();
-        clearInterval(interval);
-        this.postingIntervals.delete(jobId);
-        this.logger.log(`Job ${jobId} stopped`);
-        return;
-      }
-
-      if (currentJob.pauseRequested) {
-        this.logger.log(`Job ${jobId} paused`);
-        return;
-      }
-
-      // Shuffle again for new round
-      const reshuffledGroups = this.shuffleArray([...groups]);
-      await this.postRound(currentJob, reshuffledGroups);
-    }, this.getRandomRoundDelay());
-
-    this.postingIntervals.set(jobId, interval);
-  }
-
-  /**
-   * Post one round to all groups
-   */
-  private async postRound(job: PostingJob, groups: GroupInfo[]): Promise<void> {
-    const startTime = Date.now();
-
-    for (const group of groups) {
-      if (job.stopRequested || job.status === 'stopped') {
+    while (true) {
+      // Stop tekshirish
+      if (job.stopRequested) {
+        job.status = 'stopped';
+        job.endTime = new Date();
+        this.logger.log(`Job to'xtatildi: ${jobId}`);
         break;
       }
 
-      // Check if should skip
-      const skipReason = this.shouldSkipGroupById(group, job.logs);
-      if (skipReason) {
-        job.skippedGroups++;
-        job.logs.push({
-          timestamp: new Date(),
-          sessionId: group.sessionId,
-          groupName: group.name,
-          groupId: group.id,
-          status: 'skipped',
-          reason: skipReason,
-        });
-        this.logger.log(`Skipped group ${group.name}: ${skipReason}`);
+      // Pause tekshirish
+      if (job.pauseRequested) {
+        job.status = 'paused';
+        this.logger.log(`Job pauzada: ${jobId}`);
+        // Har 5 soniyada pause holatini tekshiramiz
+        await this.delay(5000);
         continue;
       }
 
-      // Post to group
+      // Guruhlarni aralashtirish (har round yangi tartib)
+      const shuffled = this.shuffleArray([...groups]);
+
+      // Round boshlash
+      await this.postRound(job, shuffled);
+
+      // Stop tekshirish (round tugagandan keyin)
+      if (job.stopRequested) {
+        job.status = 'stopped';
+        job.endTime = new Date();
+        this.logger.log(`Job to'xtatildi (round keyin): ${jobId}`);
+        break;
+      }
+
+      // 10 daqiqa pauza
+      this.logger.log(
+        `Round #${job.roundsCompleted} tugadi. 10 daqiqa pauza...` +
+        ` (Yuborildi: ${job.postedGroups}, Xato: ${job.failedGroups})`,
+      );
+
+      // 10 daqiqa kutish (lekin har 2 soniyada stop tekshiramiz)
+      const pauseEnd = Date.now() + ROUND_PAUSE_MS;
+      while (Date.now() < pauseEnd) {
+        if (job.stopRequested) break;
+        await this.delay(2000);
+      }
+    }
+  }
+
+  /**
+   * Bitta roundda barcha guruhlarga yuborish
+   */
+  private async postRound(job: PostingJob, groups: GroupInfo[]): Promise<void> {
+    const roundStart = Date.now();
+
+    for (let i = 0; i < groups.length; i++) {
+      if (job.stopRequested) break;
+      if (job.pauseRequested) {
+        // Pause bo'lsa — kutamiz
+        while (job.pauseRequested && !job.stopRequested) {
+          await this.delay(2000);
+        }
+        if (job.stopRequested) break;
+      }
+
+      const group = groups[i];
+
+      // Guruhga yuborish
       const result = await this.postToGroup(job, group);
       if (result.success) {
         job.postedGroups++;
       } else {
         job.failedGroups++;
       }
-
       job.logs.push(result.log);
 
-      // Random delay between posts (0.5 - 5 seconds)
-      if (groups.indexOf(group) < groups.length - 1) {
-        await this.delay(this.getRandomPostDelay());
+      // Oxirgi loglarni chegaralash (xotira uchun)
+      if (job.logs.length > 500) {
+        job.logs = job.logs.slice(-300);
+      }
+
+      // Guruhlar orasida RANDOM delay (0.5 - 5 soniya)
+      if (i < groups.length - 1 && !job.stopRequested) {
+        const delay = this.getRandomDelay(MIN_GROUP_DELAY_MS, MAX_GROUP_DELAY_MS);
+        await this.delay(delay);
       }
     }
 
-    const duration = Date.now() - startTime;
+    const roundDuration = Math.floor((Date.now() - roundStart) / 1000);
     job.roundsCompleted++;
+
     this.logger.log(
-      `Round ${job.roundsCompleted} completed in ${Math.floor(duration / 1000)}s. ` +
-      `Posted: ${job.postedGroups}, Failed: ${job.failedGroups}, Skipped: ${job.skippedGroups}`
+      `Round #${job.roundsCompleted} tugadi (${roundDuration}s) — ` +
+      `Yuborildi: ${job.postedGroups}, Xato: ${job.failedGroups}, O'tkazildi: ${job.skippedGroups}`,
     );
   }
 
   /**
-   * Check if group should be skipped based on logs
+   * Bitta guruhga xabar yuborish
    */
-  private shouldSkipGroupById(group: GroupInfo, logs: PostingLog[]): string | undefined {
-    // Check if already posted in this round
-    const alreadyPosted = logs.some(
-      log => log.groupId === group.id && log.status === 'success' && this.isWithinHours(log.timestamp, 1)
-    );
-
-    if (alreadyPosted) {
-      return 'Bu roundda allaqachon yuborilgan';
-    }
-
-    return group.skipReason;
-  }
-
-  /**
-   * Check if timestamp is within X hours
-   */
-  private isWithinHours(timestamp: Date, hours: number): boolean {
-    const diff = Date.now() - timestamp.getTime();
-    return diff < hours * 60 * 60 * 1000;
-  }
-
-  /**
-   * Post to a single group using real Telegram API
-   */
-  private async postToGroup(job: PostingJob, group: GroupInfo): Promise<{
-    success: boolean;
-    log: PostingLog;
-  }> {
+  private async postToGroup(
+    job: PostingJob,
+    group: GroupInfo,
+  ): Promise<{ success: boolean; log: PostingLog }> {
     const startTime = Date.now();
 
     try {
-      this.logger.log(`Posting to group ${group.name} (${group.id})`);
-
-      // Get the group's telegram ID from database
-      const dbGroup = await this.prisma.group.findUnique({
-        where: { id: group.id },
-      });
-
-      if (!dbGroup) {
-        throw new Error('Group not found in database');
+      // Session ulangan mi
+      if (!this.telegramService.isClientConnected(group.sessionId)) {
+        // Qayta ulashga urinish
+        try {
+          await this.telegramService.connectSession(group.sessionId);
+        } catch {
+          return {
+            success: false,
+            log: {
+              timestamp: new Date(),
+              sessionId: group.sessionId,
+              sessionName: group.sessionName,
+              groupName: group.name,
+              groupId: group.id,
+              status: 'skipped',
+              reason: 'Session ulangan emas',
+            },
+          };
+        }
       }
 
-      // Send message via TelegramService
-      const result = await this.telegramService.sendMessage(
+      // Xabar yuborish
+      await this.telegramService.sendMessage(
         group.sessionId,
-        dbGroup.telegramId,
+        group.telegramId,
         job.adContent,
       );
 
-      // Update group's last post timestamp
+      // Guruh last post vaqtini yangilash
       await this.prisma.group.update({
         where: { id: group.id },
         data: { lastPostAt: new Date() },
-      });
-
-      const duration = Date.now() - startTime;
+      }).catch(() => {}); // DB xatolik bo'lsa davom etamiz
 
       return {
         success: true,
         log: {
           timestamp: new Date(),
           sessionId: group.sessionId,
+          sessionName: group.sessionName,
           groupName: group.name,
           groupId: group.id,
           status: 'success',
-          duration,
+          duration: Date.now() - startTime,
         },
       };
     } catch (error: any) {
-      const duration = Date.now() - startTime;
+      const errorMsg = error.message || 'Noma\'lum xatolik';
 
-      // Handle specific errors
-      if (error.message?.startsWith('FLOOD_WAIT:')) {
-        const waitSeconds = parseInt(error.message.split(':')[1]);
-        this.logger.warn(`Flood wait ${waitSeconds}s - pausing job ${job.id}`);
-        job.pauseRequested = true;
-        job.status = 'paused';
+      // FLOOD_WAIT — session uchun pauza
+      if (errorMsg.startsWith('FLOOD_WAIT:')) {
+        const waitSeconds = parseInt(errorMsg.split(':')[1]);
+        this.logger.warn(`FLOOD_WAIT ${waitSeconds}s — ${group.sessionName}`);
+        // Kichik flood bo'lsa — kutamiz
+        if (waitSeconds <= 30) {
+          await this.delay(waitSeconds * 1000);
+        }
+        // Katta flood — bu guruhni skip qilamiz
       }
 
-      if (error.message?.startsWith('WRITE_FORBIDDEN:')) {
-        // Mark group as having restrictions
+      // Yozish taqiqlangan — guruhni belgilash
+      if (errorMsg.startsWith('WRITE_FORBIDDEN:')) {
         await this.prisma.group.update({
           where: { id: group.id },
           data: {
@@ -326,12 +343,14 @@ export class PostingService {
             isSkipped: true,
             skipReason: 'Yozish taqiqlangan',
           },
-        });
+        }).catch(() => {});
       }
 
-      if (error.message?.startsWith('SESSION_DEAD:')) {
-        // Session is dead, stop the entire job
-        job.stopRequested = true;
+      // Session o'lgan
+      if (errorMsg.startsWith('SESSION_DEAD:')) {
+        this.logger.error(`Session o'lgan: ${group.sessionId}`);
+        // Bu sessionning barcha guruhlarini skip qilmaymiz,
+        // boshqa sessiondagi guruhlar davom etadi
       }
 
       return {
@@ -339,33 +358,23 @@ export class PostingService {
         log: {
           timestamp: new Date(),
           sessionId: group.sessionId,
+          sessionName: group.sessionName,
           groupName: group.name,
           groupId: group.id,
           status: 'failed',
-          reason: error.message,
-          duration,
+          reason: errorMsg,
+          duration: Date.now() - startTime,
         },
       };
     }
   }
 
-  /**
-   * Get random post delay between 0.5 and 5 seconds
-   */
-  private getRandomPostDelay(): number {
-    return Math.random() * 4500 + 500; // 500ms to 5000ms
+  // ==================== UTILITY METHODS ====================
+
+  private getRandomDelay(min: number, max: number): number {
+    return Math.floor(Math.random() * (max - min + 1)) + min;
   }
 
-  /**
-   * Get random round delay between 5 and 15 minutes
-   */
-  private getRandomRoundDelay(): number {
-    return Math.random() * 600000 + 300000; // 5min to 15min in ms
-  }
-
-  /**
-   * Shuffle array
-   */
   private shuffleArray<T>(array: T[]): T[] {
     for (let i = array.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
@@ -374,73 +383,51 @@ export class PostingService {
     return array;
   }
 
-  /**
-   * Delay helper
-   */
   private delay(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
-  /**
-   * Get job status
-   */
+  // ==================== JOB MANAGEMENT ====================
+
   getJob(jobId: string): PostingJob | undefined {
     return this.activeJobs.get(jobId);
   }
 
-  /**
-   * Get all jobs for user
-   */
   getUserJobs(userId: string): PostingJob[] {
-    return Array.from(this.activeJobs.values());
+    return Array.from(this.activeJobs.values()).filter(j => j.userId === userId);
   }
 
-  /**
-   * Stop job
-   */
   stopJob(jobId: string): void {
     const job = this.activeJobs.get(jobId);
     if (job) {
       job.stopRequested = true;
-      this.logger.log(`Stop requested for job ${jobId}`);
+      this.logger.log(`To'xtatish so'raldi: ${jobId}`);
     }
   }
 
-  /**
-   * Pause job
-   */
   pauseJob(jobId: string): void {
     const job = this.activeJobs.get(jobId);
     if (job) {
       job.pauseRequested = true;
       job.status = 'paused';
-      this.logger.log(`Pause requested for job ${jobId}`);
+      this.logger.log(`Pauza so'raldi: ${jobId}`);
     }
   }
 
-  /**
-   * Resume job
-   */
   resumeJob(jobId: string): void {
     const job = this.activeJobs.get(jobId);
     if (job) {
       job.pauseRequested = false;
       job.status = 'running';
-      this.logger.log(`Resumed job ${jobId}`);
+      this.logger.log(`Davom ettirildi: ${jobId}`);
     }
   }
 
-  /**
-   * Get job logs
-   */
   getJobLogs(jobId: string): PostingLog[] {
     const job = this.activeJobs.get(jobId);
     return job?.logs || [];
   }
 
-  /**
-   * Get job statistics
-   */
   getJobStats(jobId: string): {
     totalGroups: number;
     postedGroups: number;
@@ -457,6 +444,8 @@ export class PostingService {
       ? job.endTime.getTime() - job.startTime.getTime()
       : Date.now() - job.startTime.getTime();
 
+    const totalAttempts = job.postedGroups + job.failedGroups;
+
     return {
       totalGroups: job.totalGroups,
       postedGroups: job.postedGroups,
@@ -464,20 +453,17 @@ export class PostingService {
       skippedGroups: job.skippedGroups,
       roundsCompleted: job.roundsCompleted,
       duration,
-      successRate: job.totalGroups > 0 ? (job.postedGroups / job.totalGroups) * 100 : 0,
+      successRate: totalAttempts > 0 ? (job.postedGroups / totalAttempts) * 100 : 0,
     };
   }
 
-  /**
-   * Cleanup completed jobs
-   */
   cleanupJob(jobId: string): void {
-    const interval = this.postingIntervals.get(jobId);
-    if (interval) {
-      clearInterval(interval);
-      this.postingIntervals.delete(jobId);
+    const timer = this.jobTimers.get(jobId);
+    if (timer) {
+      clearTimeout(timer);
+      this.jobTimers.delete(jobId);
     }
     this.activeJobs.delete(jobId);
-    this.logger.log(`Cleaned up job ${jobId}`);
+    this.logger.log(`Job tozalandi: ${jobId}`);
   }
 }

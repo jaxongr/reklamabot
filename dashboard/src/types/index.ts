@@ -234,3 +234,10 @@ export interface PostStatistics {
   failed: number
   today: number
 }
+
+export interface PaymentCard {
+  bankName: string
+  cardNumber: string
+  cardHolder: string
+  description?: string
+}

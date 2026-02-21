@@ -4,24 +4,61 @@ import { Telegraf, Markup } from 'telegraf';
 import { message } from 'telegraf/filters';
 import { PostingService } from '../posts/posting.service';
 import { TelegramService } from '../telegram/telegram.service';
+import { PrismaService } from '../common/prisma.service';
+import { SystemConfigService } from '../common/system-config.service';
+import { PaymentsService } from '../payments/payments.service';
+import { SubscriptionsService } from '../subscriptions/subscriptions.service';
+import { SubscriptionPlan } from '@prisma/client';
+import { createWriteStream, existsSync, mkdirSync } from 'fs';
+import { join, extname } from 'path';
+import { v4 as uuidv4 } from 'uuid';
+import * as https from 'https';
+import * as http from 'http';
 
-interface Ad {
-  id: string;
-  userId: number;
-  userName: string;
-  content: string;
-  createdAt: Date;
-  postingJobId?: string;
-  isPosting?: boolean;
-}
+// ==================== INTERFACES ====================
 
 interface SessionCreation {
-  userId: number;
-  step: 'phone' | 'code' | 'password' | 'name';
+  step: 'phone' | 'code' | 'password';
   phone?: string;
-  phoneCodeHash?: string;
   sessionId?: string;
 }
+
+interface SubscriptionFlow {
+  step: 'select_plan' | 'awaiting_receipt';
+  selectedPlan?: SubscriptionPlan;
+  amount?: number;
+}
+
+interface PostingState {
+  step: 'select_ad';
+}
+
+const PLAN_INFO: Record<string, { name: string; price: number; emoji: string; features: string[] }> = {
+  STARTER: {
+    name: 'Starter',
+    price: 50000,
+    emoji: '🟢',
+    features: ['5 ta e\'lon', '1 ta session', '50 ta guruh'],
+  },
+  BUSINESS: {
+    name: 'Business',
+    price: 150000,
+    emoji: '🔵',
+    features: ['20 ta e\'lon', '3 ta session', '200 ta guruh'],
+  },
+  PREMIUM: {
+    name: 'Premium',
+    price: 300000,
+    emoji: '🟡',
+    features: ['50 ta e\'lon', '5 ta session', '500 ta guruh'],
+  },
+  ENTERPRISE: {
+    name: 'Enterprise',
+    price: 500000,
+    emoji: '🔴',
+    features: ['Cheksiz e\'lon', '10 ta session', 'Cheksiz guruh'],
+  },
+};
 
 @Injectable()
 export class TelegramBotService implements OnModuleInit, OnModuleDestroy, BeforeApplicationShutdown {
@@ -30,876 +67,952 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy, Before
   private readonly botToken: string;
   private isBotRunning = false;
 
-  // Simple in-memory ads storage
-  private ads: Ad[] = [];
-  private awaitingAdCreation = new Set<number>();
+  // Foydalanuvchi holatlari
   private pendingSessions = new Map<number, SessionCreation>();
+  private subscriptionFlows = new Map<number, SubscriptionFlow>();
+  private awaitingAdText = new Set<number>();
 
   constructor(
     private readonly config: ConfigService,
     private readonly postingService: PostingService,
     private readonly telegramService: TelegramService,
+    private readonly prisma: PrismaService,
+    private readonly systemConfig: SystemConfigService,
+    private readonly paymentsService: PaymentsService,
+    private readonly subscriptionsService: SubscriptionsService,
   ) {
     this.botToken = this.config.get<string>('TELEGRAM_BOT_TOKEN') || '';
     this.bot = new Telegraf(this.botToken, {
-      handlerTimeout: 10000,
+      handlerTimeout: 30000,
     });
   }
 
+  // ==================== LIFECYCLE ====================
+
   async onModuleInit() {
     try {
-      this.logger.log('Initializing Telegram bot...');
+      this.logger.log('Telegram bot ishga tushmoqda...');
       this.setupCommands();
       this.setupErrorHandling();
 
-      // Test bot connection first
-      this.logger.log('Testing bot connection...');
       const botInfo = await this.bot.telegram.getMe();
-      this.logger.log(`Bot connected: @${botInfo.username} (${botInfo.first_name})`);
+      this.logger.log(`Bot ulandi: @${botInfo.username} (${botInfo.first_name})`);
 
-      // Start polling (non-blocking)
-      this.logger.log('Starting bot polling...');
-      this.bot.launch({
-        dropPendingUpdates: true,
-      }).then(() => {
+      this.bot.launch({ dropPendingUpdates: true }).then(() => {
         this.isBotRunning = true;
-        this.logger.log('Telegram bot started successfully!');
+        this.logger.log('Telegram bot muvaffaqiyatli ishga tushdi!');
       }).catch((err) => {
-        this.logger.error('Bot launch error:', err.message);
+        this.logger.error('Bot ishga tushishda xatolik:', err.message);
       });
     } catch (error) {
-      this.logger.error('Failed to start Telegram bot:', error.message);
-      this.logger.warn('Bot will not respond to commands.');
-      if (error.response) {
-        this.logger.error(`Telegram API error: ${JSON.stringify(error.response)}`);
-      }
+      this.logger.error('Bot ishga tushirilmadi:', error.message);
     }
   }
 
   async onModuleDestroy() {
     if (this.isBotRunning) {
-      this.logger.log('Stopping Telegram bot...');
       try {
         await this.bot.stop();
         this.isBotRunning = false;
-        this.logger.log('Telegram bot stopped successfully');
-      } catch (error) {
-        this.logger.error('Error stopping Telegram bot:', error);
-      }
+      } catch {}
     }
   }
 
   beforeApplicationShutdown() {
-    this.logger.log('Application shutdown - stopping bot...');
     this.bot.stop();
   }
 
   private setupErrorHandling() {
     this.bot.catch((err, ctx) => {
-      this.logger.error(`Bot error for update ${ctx.update.update_id}:`, err);
+      this.logger.error(`Bot xatolik (${ctx.update.update_id}):`, err);
     });
   }
 
-  // Main menu keyboard
+  // ==================== HELPERS ====================
+
   private getMainMenu() {
     return Markup.keyboard([
       ['✍️ E\'lon yaratish', '📊 Mening e\'lonlarim'],
       ['🚀 Tarqatishni boshlash', '⏸ Tarqatishni to\'xtatish'],
       ['📱 Session ulash', '📋 Mening sessionlarim'],
-      ['📈 Hisobot', '📚 Yordam'],
-    ])
-      .resize()
-      .oneTime();
+      ['💳 Obuna / To\'lov', '📈 Hisobot'],
+      ['📚 Yordam'],
+    ]).resize();
   }
 
-  // Back button
-  private getBackButton() {
-    return Markup.inlineKeyboard([
-      [Markup.button.callback('◀️ Orqaga', 'back_to_main')],
-    ]);
+  /**
+   * Foydalanuvchini DB dan topish yoki yaratish
+   */
+  private async getOrCreateUser(ctx: any) {
+    const tgId = ctx.from?.id?.toString();
+    if (!tgId) return null;
+
+    try {
+      let user = await this.prisma.user.findUnique({
+        where: { telegramId: tgId },
+        include: { subscription: true },
+      });
+
+      if (!user) {
+        user = await this.prisma.user.create({
+          data: {
+            telegramId: tgId,
+            firstName: ctx.from.first_name,
+            lastName: ctx.from.last_name,
+            username: ctx.from.username,
+          },
+          include: { subscription: true },
+        });
+        this.logger.log(`Yangi foydalanuvchi yaratildi: ${tgId}`);
+      }
+
+      return user;
+    } catch (error) {
+      this.logger.error(`Foydalanuvchi olishda xatolik: ${error.message}`);
+      return null;
+    }
   }
+
+  private async downloadPhoto(ctx: any): Promise<string> {
+    const photos = ctx.message.photo;
+    const biggestPhoto = photos[photos.length - 1];
+    const file = await ctx.telegram.getFile(biggestPhoto.file_id);
+    const fileUrl = `https://api.telegram.org/file/bot${this.botToken}/${file.file_path}`;
+
+    const uploadDir = join(process.cwd(), 'uploads', 'receipts');
+    if (!existsSync(uploadDir)) {
+      mkdirSync(uploadDir, { recursive: true });
+    }
+
+    const ext = extname(file.file_path || '.jpg') || '.jpg';
+    const filename = `${uuidv4()}${ext}`;
+    const filePath = join(uploadDir, filename);
+
+    return new Promise((resolve, reject) => {
+      const protocol = fileUrl.startsWith('https') ? https : http;
+      protocol.get(fileUrl, (response) => {
+        const stream = createWriteStream(filePath);
+        response.pipe(stream);
+        stream.on('finish', () => {
+          stream.close();
+          resolve(`/uploads/receipts/${filename}`);
+        });
+        stream.on('error', reject);
+      }).on('error', reject);
+    });
+  }
+
+  // ==================== COMMANDS SETUP ====================
 
   private setupCommands() {
-    // Start command
-    this.bot.start((ctx) => {
-      const welcomeMessage =
+    // ========== /start ==========
+    this.bot.start(async (ctx) => {
+      await this.getOrCreateUser(ctx);
+
+      ctx.reply(
         '👋 *Assalomu alaykum!*\n\n' +
         '🤖 *Reklama Bot* ga xush kelibsiz!\n\n' +
         '📝 *Bot funksiyalari:*\n' +
-        '• E\'lon yaratish (matn shaklida)\n' +
-        '• Multi-session tarqatish (10+ account)\n' +
-        '• Avtomatik tarqatish (5-15 min)\n' +
-        '• Hisobotlar va statistika\n\n' +
-        '👇 Quyidagi menudan tanlang:';
-
-      ctx.reply(welcomeMessage, {
-        parse_mode: 'Markdown',
-        ...this.getMainMenu(),
-      });
+        '• 📱 Session ulash (10+ account)\n' +
+        '• ✍️ E\'lon yaratish\n' +
+        '• 🚀 Barcha sessionlar orqali tarqatish\n' +
+        '• 📈 Hisobot va statistika\n' +
+        '• 💳 Obuna va to\'lov\n\n' +
+        '👇 Quyidagi menudan tanlang:',
+        { parse_mode: 'Markdown', ...this.getMainMenu() },
+      );
     });
 
-    // Help command
-    this.bot.command('help', (ctx) => {
-      const helpMessage =
-        '📚 *Yordam*\n\n' +
-        '🔹 *E\'lon yaratish:* "✍️ E\'lon yaratish" tugmasini bosing va matn yuboring\n' +
-        '🔹 *Tarqatish:* E\'lonni tanlang va "🚀 Tarqatishni boshlash" tugmasini bosing\n' +
-        '🔹 *Multi-session:* Barcha ulangan sessionlardagi guruhlarga tarqatadi\n' +
-        '🔹 *Delay:* Guruhlar orasida 0.5-5 soniya, roundlar orasida 5-15 daqiqa\n\n' +
-        '📝 *E\'lon misoli:*\n' +
-        '```\n' +
-        'Плошатка керак\n' +
-        'Юк пишган гишт паддонда\n' +
-        '991175530\n' +
-        '```\n\n' +
-        '❓ Savollaringiz bo\'lsa, admin bilan bog\'laning';
-
-      ctx.reply(helpMessage, {
-        parse_mode: 'Markdown',
-        ...this.getMainMenu(),
-      });
-    });
-
-    // Session connect button
-    this.bot.hears(/📱 Session ulash/, (ctx) => {
+    // ========== 📱 SESSION ULASH ==========
+    this.bot.hears(/📱 Session ulash/, async (ctx) => {
       const userId = ctx.from?.id;
-
       if (!userId) return;
 
-      this.pendingSessions.set(userId, {
-        userId,
-        step: 'phone',
-      });
+      // Boshqa jarayonlarni tozalash
+      this.clearUserState(userId);
+
+      this.pendingSessions.set(userId, { step: 'phone' });
 
       ctx.reply(
         '📱 *Session ulash*\n\n' +
-        '🔐 Telegram accountingizni ulash uchun:\n\n' +
-        '1️⃣ Telefon raqamingizni yuboring\n' +
-        '2️⃣ Kodni yuboring\n' +
-        '3️⃣ Session saqlanadi!\n\n' +
-        '📝 *Format:* `998901234567`\n\n' +
-        '⏳ Telefon raqamingizni yuboring...',
+        'Telegram accountingizni ulash uchun telefon raqamingizni yuboring.\n\n' +
+        '📝 *Format:* `+998901234567`\n\n' +
+        '⚠️ *Eslatma:* Kod Telegram ilovangizga keladi.\n\n' +
+        '⏳ Telefon raqamingizni kutmoqda...',
         {
           parse_mode: 'Markdown',
           ...Markup.inlineKeyboard([
             [Markup.button.callback('❌ Bekor qilish', 'cancel_session')],
           ]),
-        }
+        },
       );
     });
 
-    // My sessions button
-    this.bot.hears(/📋 Mening sessionlarim/, (ctx) => {
-      ctx.reply(
-        '📋 *Mening sessionlarim*\n\n' +
-        '⚠️ *Ma\'lumot:* Sessionlar ma\'lumotlar bazasida saqlanadi.\n\n' +
-        'Hozircha database ulanmagan. Sessionlarni ko\'rish uchun:\n' +
-        '1. Ma\'lumotlar bazasini o\'rnating\n' +
-        '2. Backendni qayta ishga tushiring\n\n' +
-        '💡 *Session ulash uchun:* "📱 Session ulash" tugmasini bosing.',
-        {
+    // ========== 📋 MENING SESSIONLARIM ==========
+    this.bot.hears(/📋 Mening sessionlarim/, async (ctx) => {
+      const user = await this.getOrCreateUser(ctx);
+      if (!user) return;
+
+      try {
+        const sessions = await this.telegramService.getUserSessions(user.id);
+
+        if (sessions.length === 0) {
+          ctx.reply(
+            '📋 *Mening sessionlarim*\n\n' +
+            '🔍 Sizda hech qanday session yo\'q.\n\n' +
+            '💡 "📱 Session ulash" tugmasini bosing.',
+            { parse_mode: 'Markdown', ...this.getMainMenu() },
+          );
+          return;
+        }
+
+        let msg = '📋 *Mening sessionlarim*\n\n';
+
+        for (let i = 0; i < sessions.length; i++) {
+          const s = sessions[i];
+          const connected = this.telegramService.isClientConnected(s.id);
+          const statusEmoji = connected ? '🟢' : s.isFrozen ? '🔴' : '🟡';
+          const groupCount = (s as any)._count?.groups || 0;
+
+          msg += `${i + 1}. ${statusEmoji} *${s.name || 'Nomsiz'}*\n`;
+          msg += `   📞 ${s.phone || '—'}\n`;
+          msg += `   📊 ${groupCount} ta guruh\n`;
+          msg += `   📅 ${s.status}`;
+          if (s.isFrozen) msg += ' (Muzlatilgan)';
+          msg += '\n\n';
+        }
+
+        msg += `📱 Jami: ${sessions.length} ta session\n`;
+        msg += `🟢 Ulangan: ${sessions.filter(s => this.telegramService.isClientConnected(s.id)).length}`;
+
+        // Inline tugmalar
+        const buttons: any[][] = [];
+        for (const s of sessions) {
+          const label = `${s.name || s.phone || s.id.slice(0, 8)}`;
+          if (this.telegramService.isClientConnected(s.id)) {
+            buttons.push([
+              Markup.button.callback(`🔄 Sinxron: ${label}`, `sync_${s.id}`),
+              Markup.button.callback(`🔌 Uzish: ${label}`, `disconnect_${s.id}`),
+            ]);
+          } else if (s.status === 'ACTIVE' && s.sessionString) {
+            buttons.push([
+              Markup.button.callback(`🔗 Ulash: ${label}`, `reconnect_${s.id}`),
+              Markup.button.callback(`🗑 O'chirish: ${label}`, `delete_session_${s.id}`),
+            ]);
+          } else {
+            buttons.push([
+              Markup.button.callback(`🗑 O'chirish: ${label}`, `delete_session_${s.id}`),
+            ]);
+          }
+        }
+        buttons.push([Markup.button.callback('◀️ Orqaga', 'back_to_main')]);
+
+        ctx.reply(msg, {
           parse_mode: 'Markdown',
-          ...this.getMainMenu(),
-        }
-      );
+          ...Markup.inlineKeyboard(buttons),
+        });
+      } catch (error) {
+        this.logger.error(`Sessionlar ko'rsatishda xatolik: ${error.message}`);
+        ctx.reply('❌ Xatolik yuz berdi.', this.getMainMenu());
+      }
     });
 
-    // Create ad button
-    this.bot.hears(/✍️ E'lon yaratish/, (ctx) => {
-      const userId = ctx.from?.id;
+    // Session callback'lari
+    this.bot.action(/sync_(.+)/, async (ctx) => {
+      const sessionId = ctx.match[1];
+      ctx.answerCbQuery('🔄 Sinxronlanmoqda...');
 
+      try {
+        const count = await this.telegramService.syncGroups(sessionId);
+        ctx.reply(
+          `✅ *Guruhlar sinxronlandi!*\n\n📊 Jami: ${count} ta guruh`,
+          { parse_mode: 'Markdown', ...this.getMainMenu() },
+        );
+      } catch (error) {
+        ctx.reply(`❌ Sinxronlashda xatolik: ${error.message}`, this.getMainMenu());
+      }
+    });
+
+    this.bot.action(/disconnect_(.+)/, async (ctx) => {
+      const sessionId = ctx.match[1];
+      ctx.answerCbQuery('🔌 Uzilmoqda...');
+
+      try {
+        await this.telegramService.disconnectSession(sessionId);
+        ctx.reply('✅ Session uzildi.', this.getMainMenu());
+      } catch (error) {
+        ctx.reply(`❌ Xatolik: ${error.message}`, this.getMainMenu());
+      }
+    });
+
+    this.bot.action(/reconnect_(.+)/, async (ctx) => {
+      const sessionId = ctx.match[1];
+      ctx.answerCbQuery('🔗 Ulanmoqda...');
+
+      try {
+        await this.telegramService.connectSession(sessionId);
+        const count = await this.telegramService.syncGroups(sessionId);
+        ctx.reply(
+          `✅ *Session qayta ulandi!*\n📊 ${count} ta guruh`,
+          { parse_mode: 'Markdown', ...this.getMainMenu() },
+        );
+      } catch (error) {
+        ctx.reply(`❌ Ulashda xatolik: ${error.message}`, this.getMainMenu());
+      }
+    });
+
+    this.bot.action(/delete_session_(.+)/, async (ctx) => {
+      const sessionId = ctx.match[1];
+      ctx.answerCbQuery("O'chirilmoqda...");
+
+      try {
+        await this.telegramService.deleteSession(sessionId);
+        ctx.reply("✅ Session o'chirildi.", this.getMainMenu());
+      } catch (error) {
+        ctx.reply(`❌ Xatolik: ${error.message}`, this.getMainMenu());
+      }
+    });
+
+    // ========== ✍️ E'LON YARATISH ==========
+    this.bot.hears(/✍️ E'lon yaratish/, async (ctx) => {
+      const userId = ctx.from?.id;
       if (!userId) return;
 
-      this.awaitingAdCreation.add(userId);
+      this.clearUserState(userId);
+      this.awaitingAdText.add(userId);
 
       ctx.reply(
         '✍️ *E\'lon yaratish*\n\n' +
-        '📝 Iltimos, e\'lon matnini yuboring.\n\n' +
-        '📌 *Masalan:*\n' +
-        '```\n' +
-        'Плошатка керак\n' +
-        'Юк пишган гишт паддонда\n' +
-        '991175530\n' +
-        '```\n\n' +
-        '⏳ Matnni yuborishingizni kutmoqda...',
+        'E\'lon matnini yuboring:\n\n' +
+        '📌 *Misol:*\n```\nPloshchadka kerak\nYuk pishgan g\'isht paddonida\n998901234567\n```\n\n' +
+        '⏳ Matnni kutmoqda...',
         {
           parse_mode: 'Markdown',
           ...Markup.inlineKeyboard([
-            [Markup.button.callback('❌ Bekor qilish', 'cancel_create')],
+            [Markup.button.callback('❌ Bekor qilish', 'cancel_ad')],
           ]),
-        }
+        },
       );
     });
 
-    // My ads button
-    this.bot.hears(/📊 Mening e'lonlarim/, (ctx) => {
-      const userId = ctx.from?.id;
+    // ========== 📊 MENING E'LONLARIM ==========
+    this.bot.hears(/📊 Mening e'lonlarim/, async (ctx) => {
+      const user = await this.getOrCreateUser(ctx);
+      if (!user) return;
 
-      if (!userId) return;
+      try {
+        const ads = await this.prisma.ad.findMany({
+          where: { userId: user.id, status: { not: 'ARCHIVED' } },
+          orderBy: { createdAt: 'desc' },
+          take: 20,
+        });
 
-      const userAds = this.ads.filter((ad) => ad.userId === userId);
-
-      if (userAds.length === 0) {
-        ctx.reply(
-          '📊 *Mening e\'lonlarim*\n\n' +
-          '🔍 Sizda hozircha hech qanday e\'lon yo\'q.\n\n' +
-          '💡 Yangi e\'lon yaratish uchun "✍️ E\'lon yaratish" tugmasini bosing.',
-          {
-            parse_mode: 'Markdown',
-            ...this.getMainMenu(),
-          }
-        );
-        return;
-      }
-
-      let message = '📊 *Mening e\'lonlarim*\n\n';
-
-      userAds.forEach((ad, index) => {
-        const preview = ad.content.length > 50
-          ? ad.content.substring(0, 50) + '...'
-          : ad.content;
-        message += `${index + 1}. ${preview}\n`;
-        if (ad.isPosting) {
-          message += `   🚀 *Tarqatilmoqda...*\n`;
+        if (ads.length === 0) {
+          ctx.reply(
+            '📊 *Mening e\'lonlarim*\n\n🔍 E\'lon yo\'q.\n💡 "✍️ E\'lon yaratish" tugmasini bosing.',
+            { parse_mode: 'Markdown', ...this.getMainMenu() },
+          );
+          return;
         }
-        message += `   📅 ${new Date(ad.createdAt).toLocaleString('uz-UZ')}\n\n`;
-      });
 
-      message += '📝 Jami: ' + userAds.length + ' ta e\'lon';
+        let msg = '📊 *Mening e\'lonlarim*\n\n';
 
-      ctx.reply(message, {
-        parse_mode: 'Markdown',
-        ...this.getMainMenu(),
-      });
-    });
+        const buttons: any[][] = [];
+        for (let i = 0; i < ads.length; i++) {
+          const ad = ads[i];
+          const preview = ad.content.length > 50 ? ad.content.slice(0, 50) + '...' : ad.content;
+          const statusEmoji = ad.status === 'ACTIVE' ? '🟢' : ad.status === 'PAUSED' ? '⏸' : '📝';
+          msg += `${i + 1}. ${statusEmoji} ${preview}\n`;
+          msg += `   📅 ${new Date(ad.createdAt).toLocaleDateString('uz-UZ')}\n\n`;
 
-    // Start posting button
-    this.bot.hears(/🚀 Tarqatishni boshlash/, (ctx) => {
-      const userId = ctx.from?.id;
-
-      if (!userId) return;
-
-      const userAds = this.ads.filter((ad) => ad.userId === userId);
-
-      if (userAds.length === 0) {
-        ctx.reply(
-          '🚀 *Tarqatishni boshlash*\n\n' +
-          '🔍 Sizda hech qanday e\'lon yo\'q.\n\n' +
-          '💡 Avval e\'lon yarating.',
-          {
-            parse_mode: 'Markdown',
-            ...this.getMainMenu(),
-          }
-        );
-        return;
-      }
-
-      let message = '🚀 *Tarqatishni boshlash*\n\n';
-      message += '📝 Tarqatmoqchi bo\'lgan e\'loningiz raqamini yuboring:\n\n';
-
-      userAds.forEach((ad, index) => {
-        const preview = ad.content.length > 40
-          ? ad.content.substring(0, 40) + '...'
-          : ad.content;
-        message += `/${index + 1} - ${preview}\n`;
-        if (ad.isPosting) {
-          message += `   (🚀 Tarqatilmoqda)\n`;
+          buttons.push([
+            Markup.button.callback(`🚀 Tarqat: #${i + 1}`, `post_ad_${ad.id}`),
+            Markup.button.callback(`🗑 O'chir: #${i + 1}`, `del_ad_${ad.id}`),
+          ]);
         }
-        message += '\n';
-      });
 
-      this.awaitingAdCreation.add(userId);
+        buttons.push([Markup.button.callback('◀️ Orqaga', 'back_to_main')]);
 
-      ctx.reply(message, {
-        parse_mode: 'Markdown',
-        ...Markup.inlineKeyboard([
-          [Markup.button.callback('❌ Bekor qilish', 'cancel_post_start')],
-        ]),
-      });
+        ctx.reply(msg, {
+          parse_mode: 'Markdown',
+          ...Markup.inlineKeyboard(buttons),
+        });
+      } catch (error) {
+        ctx.reply('❌ Xatolik yuz berdi.', this.getMainMenu());
+      }
     });
 
-    // Stop posting button
-    this.bot.hears(/⏸ Tarqatishni to'xtatish/, (ctx) => {
-      const userId = ctx.from?.id;
+    // E'lon tarqatish callback
+    this.bot.action(/post_ad_(.+)/, async (ctx) => {
+      const adId = ctx.match[1];
+      ctx.answerCbQuery('🚀 Tarqatish boshlanmoqda...');
 
-      if (!userId) return;
+      const user = await this.getOrCreateUser(ctx);
+      if (!user) return;
 
-      const userAds = this.ads.filter((ad) => ad.userId === userId && ad.isPosting);
+      try {
+        const ad = await this.prisma.ad.findUnique({ where: { id: adId } });
+        if (!ad) {
+          ctx.reply('❌ E\'lon topilmadi.', this.getMainMenu());
+          return;
+        }
 
-      if (userAds.length === 0) {
+        const job = await this.postingService.startPosting(ad.id, ad.content, user.id);
+        const stats = this.postingService.getJobStats(job.id);
+
+        // E'lon statusini yangilash
+        await this.prisma.ad.update({
+          where: { id: adId },
+          data: { status: 'ACTIVE' },
+        });
+
         ctx.reply(
-          '⏸ *Tarqatishni to\'xtatish*\n\n' +
-          '🔍 Sizda hech qanday tarqatilayotgan e\'lon yo\'q.',
-          {
-            parse_mode: 'Markdown',
-            ...this.getMainMenu(),
-          }
+          '✅ *Tarqatish boshlandi!*\n\n' +
+          `📊 *Guruhlar:* ${stats?.totalGroups || 0}\n` +
+          '⏱ *Delay:* 0.5-5s (guruh), 10 min (round)\n\n' +
+          '📈 "📈 Hisobot" — natijalarni ko\'ring\n' +
+          '⏸ "⏸ Tarqatishni to\'xtatish" — to\'xtatish',
+          { parse_mode: 'Markdown', ...this.getMainMenu() },
+        );
+      } catch (error) {
+        ctx.reply(`❌ Xatolik: ${error.message}`, this.getMainMenu());
+      }
+    });
+
+    // E'lonni o'chirish
+    this.bot.action(/del_ad_(.+)/, async (ctx) => {
+      const adId = ctx.match[1];
+      ctx.answerCbQuery("O'chirildi");
+
+      try {
+        await this.prisma.ad.update({
+          where: { id: adId },
+          data: { status: 'ARCHIVED' },
+        });
+        ctx.reply("✅ E'lon o'chirildi.", this.getMainMenu());
+      } catch {
+        ctx.reply('❌ Xatolik.', this.getMainMenu());
+      }
+    });
+
+    // ========== 🚀 TARQATISHNI BOSHLASH ==========
+    this.bot.hears(/🚀 Tarqatishni boshlash/, async (ctx) => {
+      const user = await this.getOrCreateUser(ctx);
+      if (!user) return;
+
+      const ads = await this.prisma.ad.findMany({
+        where: { userId: user.id, status: { in: ['DRAFT', 'ACTIVE', 'PAUSED'] } },
+        orderBy: { createdAt: 'desc' },
+        take: 10,
+      });
+
+      if (ads.length === 0) {
+        ctx.reply(
+          '🚀 *Tarqatish*\n\n🔍 E\'lon yo\'q. Avval e\'lon yarating.',
+          { parse_mode: 'Markdown', ...this.getMainMenu() },
         );
         return;
       }
 
-      let message = '⏸ *Tarqatishni to\'xtatish*\n\n';
-      message += '📝 To\'xtatmoqchi bo\'lgan e\'loningiz raqamini yuboring:\n\n';
+      let msg = '🚀 *Tarqatish uchun e\'lon tanlang:*\n\n';
+      const buttons: any[][] = [];
 
-      userAds.forEach((ad, index) => {
-        const preview = ad.content.length > 40
-          ? ad.content.substring(0, 40) + '...'
-          : ad.content;
-        message += `/${index + 1} - ${preview}\n`;
-        message += `   (🚀 Tarqatilmoqda)\n\n`;
-      });
+      for (let i = 0; i < ads.length; i++) {
+        const ad = ads[i];
+        const preview = ad.content.length > 40 ? ad.content.slice(0, 40) + '...' : ad.content;
+        msg += `${i + 1}. ${preview}\n\n`;
+        buttons.push([Markup.button.callback(`🚀 #${i + 1} — Tarqat`, `post_ad_${ad.id}`)]);
+      }
+      buttons.push([Markup.button.callback('◀️ Orqaga', 'back_to_main')]);
 
-      this.awaitingAdCreation.add(userId);
-
-      ctx.reply(message, {
+      ctx.reply(msg, {
         parse_mode: 'Markdown',
-        ...Markup.inlineKeyboard([
-          [Markup.button.callback('❌ Bekor qilish', 'cancel_stop')],
-        ]),
+        ...Markup.inlineKeyboard(buttons),
       });
     });
 
-    // Report button
-    this.bot.hears(/📈 Hisobot/, (ctx) => {
-      const userId = ctx.from?.id;
+    // ========== ⏸ TARQATISHNI TO'XTATISH ==========
+    this.bot.hears(/⏸ Tarqatishni to'xtatish/, async (ctx) => {
+      const user = await this.getOrCreateUser(ctx);
+      if (!user) return;
 
-      if (!userId) return;
+      const jobs = this.postingService.getUserJobs(user.id);
+      const activeJobs = jobs.filter(j => j.status === 'running' || j.status === 'paused');
 
-      const userAds = this.ads.filter((ad) => ad.userId === userId && ad.postingJobId);
-
-      if (userAds.length === 0) {
+      if (activeJobs.length === 0) {
         ctx.reply(
-          '📈 *Hisobot*\n\n' +
-          '🔍 Sizda hech qanday tarqatilayotgan e\'lon yo\'q.',
-          {
-            parse_mode: 'Markdown',
-            ...this.getMainMenu(),
-          }
+          '⏸ *To\'xtatish*\n\n🔍 Faol tarqatish yo\'q.',
+          { parse_mode: 'Markdown', ...this.getMainMenu() },
         );
         return;
       }
 
-      let message = '📈 *Tarqatish hisoboti*\n\n';
-
-      for (const ad of userAds) {
-        if (!ad.postingJobId) continue;
-
-        const job = this.postingService.getJob(ad.postingJobId);
-        if (!job) continue;
-
-        const stats = this.postingService.getJobStats(ad.postingJobId);
-        if (!stats) continue;
-
-        const preview = ad.content.length > 30
-          ? ad.content.substring(0, 30) + '...'
-          : ad.content;
-
-        message += `📝 *E\'lon:* ${preview}\n`;
-        message += `📊 *Holat:* ${job.status}\n`;
-        message += `✅ *Yuborildi:* ${stats.postedGroups}/${stats.totalGroups}\n`;
-        message += `❌ *Xatolik:* ${stats.failedGroups}\n`;
-        message += `⏭️ *O\'tkazildi:* ${stats.skippedGroups}\n`;
-        message += `🔄 *Roundlar:* ${stats.roundsCompleted}\n`;
-        message += `⏱️ *Vaqt:* ${Math.floor(stats.duration / 1000)}s\n`;
-        message += `📈 *Muvaffaqiyat:* ${stats.successRate.toFixed(1)}%\n\n`;
+      for (const job of activeJobs) {
+        this.postingService.stopJob(job.id);
       }
 
-      ctx.reply(message, {
-        parse_mode: 'Markdown',
-        ...this.getMainMenu(),
+      const stats = activeJobs.map(j => this.postingService.getJobStats(j.id));
+
+      let totalPosted = 0;
+      let totalFailed = 0;
+      let totalRounds = 0;
+
+      stats.forEach(s => {
+        if (s) {
+          totalPosted += s.postedGroups;
+          totalFailed += s.failedGroups;
+          totalRounds += s.roundsCompleted;
+        }
       });
+
+      ctx.reply(
+        '✅ *Barcha tarqatishlar to\'xtatildi!*\n\n' +
+        `📊 *Yuborildi:* ${totalPosted}\n` +
+        `❌ *Xatolik:* ${totalFailed}\n` +
+        `🔄 *Roundlar:* ${totalRounds}`,
+        { parse_mode: 'Markdown', ...this.getMainMenu() },
+      );
     });
 
-    // Delete ad button
-    this.bot.hears(/🗑 E'lon o'chirish/, (ctx) => {
-      const userId = ctx.from?.id;
+    // ========== 📈 HISOBOT ==========
+    this.bot.hears(/📈 Hisobot/, async (ctx) => {
+      const user = await this.getOrCreateUser(ctx);
+      if (!user) return;
 
+      // Session statistikasi
+      const sessions = await this.telegramService.getUserSessions(user.id);
+      const connectedCount = sessions.filter(s => this.telegramService.isClientConnected(s.id)).length;
+      let totalGroups = 0;
+      sessions.forEach(s => { totalGroups += s.totalGroups; });
+
+      // Faol joblar
+      const jobs = this.postingService.getUserJobs(user.id);
+      const activeJobs = jobs.filter(j => j.status === 'running' || j.status === 'paused');
+
+      let msg = '📈 *Hisobot*\n\n';
+      msg += `📱 *Sessionlar:* ${sessions.length} (🟢 ${connectedCount} ulangan)\n`;
+      msg += `📊 *Guruhlar:* ${totalGroups}\n\n`;
+
+      if (activeJobs.length > 0) {
+        msg += '🚀 *Faol tarqatishlar:*\n\n';
+        for (const job of activeJobs) {
+          const stats = this.postingService.getJobStats(job.id);
+          if (!stats) continue;
+
+          const durationMin = Math.floor(stats.duration / 60000);
+          msg += `📋 *Job:* ${job.id.slice(0, 12)}...\n`;
+          msg += `   ✅ Yuborildi: ${stats.postedGroups}/${stats.totalGroups}\n`;
+          msg += `   ❌ Xatolik: ${stats.failedGroups}\n`;
+          msg += `   🔄 Roundlar: ${stats.roundsCompleted}\n`;
+          msg += `   ⏱ Vaqt: ${durationMin} daqiqa\n`;
+          msg += `   📈 Muvaffaqiyat: ${stats.successRate.toFixed(1)}%\n\n`;
+        }
+      } else {
+        msg += '🔍 Faol tarqatish yo\'q.\n';
+      }
+
+      ctx.reply(msg, { parse_mode: 'Markdown', ...this.getMainMenu() });
+    });
+
+    // ========== 💳 OBUNA / TO'LOV ==========
+    this.bot.hears(/💳 Obuna \/ To'lov/, async (ctx) => {
+      const userId = ctx.from?.id;
+      if (!userId) return;
+      this.clearUserState(userId);
+
+      const user = await this.getOrCreateUser(ctx);
+      if (!user) return;
+
+      let subInfo = '';
+      if ((user as any).subscription) {
+        const sub = (user as any).subscription;
+        const plan = PLAN_INFO[sub.planType];
+        const endDate = sub.endDate ? new Date(sub.endDate).toLocaleDateString('uz-UZ') : '—';
+        subInfo =
+          `\n📋 *Joriy obuna:*\n` +
+          `${plan?.emoji || '📦'} *${plan?.name || sub.planType}*\n` +
+          `📅 Tugash: ${endDate}\n` +
+          `📊 Holat: ${sub.status === 'ACTIVE' ? '✅ Faol' : '❌ ' + sub.status}\n\n`;
+      } else {
+        subInfo = '\n⚠️ *Faol obuna yo\'q.*\n\n';
+      }
+
+      ctx.reply(
+        '💳 *Obuna / To\'lov*\n' +
+        subInfo +
+        '📦 *Tariflar:*\n\n' +
+        '🟢 *STARTER* — 50,000 UZS/oy\n   5 e\'lon, 1 session, 50 guruh\n\n' +
+        '🔵 *BUSINESS* — 150,000 UZS/oy\n   20 e\'lon, 3 session, 200 guruh\n\n' +
+        '🟡 *PREMIUM* — 300,000 UZS/oy\n   50 e\'lon, 5 session, 500 guruh\n\n' +
+        '🔴 *ENTERPRISE* — 500,000 UZS/oy\n   Cheksiz e\'lon, 10 session, cheksiz guruh\n\n' +
+        '👇 Tarifni tanlang:',
+        {
+          parse_mode: 'Markdown',
+          ...Markup.inlineKeyboard([
+            [
+              Markup.button.callback('🟢 Starter 50K', 'plan_STARTER'),
+              Markup.button.callback('🔵 Business 150K', 'plan_BUSINESS'),
+            ],
+            [
+              Markup.button.callback('🟡 Premium 300K', 'plan_PREMIUM'),
+              Markup.button.callback('🔴 Enterprise 500K', 'plan_ENTERPRISE'),
+            ],
+            [Markup.button.callback('◀️ Orqaga', 'back_to_main')],
+          ]),
+        },
+      );
+    });
+
+    // Plan tanlash
+    this.bot.action(/plan_(STARTER|BUSINESS|PREMIUM|ENTERPRISE)/, async (ctx) => {
+      const userId = ctx.from?.id;
       if (!userId) return;
 
-      const userAds = this.ads.filter((ad) => ad.userId === userId && !ad.isPosting);
+      const planType = ctx.match[1] as SubscriptionPlan;
+      const plan = PLAN_INFO[planType];
+      ctx.answerCbQuery(`${plan.name} tanlandi`);
 
-      if (userAds.length === 0) {
-        ctx.reply(
-          '🗑 *E\'lon o\'chirish*\n\n' +
-          '🔍 Sizda hech qanday e\'lon yo\'q yoki tarqatilmoqda.',
-          {
-            parse_mode: 'Markdown',
-            ...this.getMainMenu(),
-          }
-        );
-        return;
+      // Karta ma'lumotlarini olish
+      let cardsMsg = '';
+      try {
+        const cards = await this.systemConfig.getPaymentCards();
+        if (cards.length > 0) {
+          cardsMsg = '💳 *To\'lov kartalari:*\n\n';
+          cards.forEach((card, i) => {
+            cardsMsg += `${i + 1}. *${card.bankName}*\n`;
+            cardsMsg += `   \`${card.cardNumber}\`\n`;
+            cardsMsg += `   ${card.cardHolder}\n`;
+            if (card.description) cardsMsg += `   _${card.description}_\n`;
+            cardsMsg += '\n';
+          });
+        } else {
+          cardsMsg = '⚠️ Karta ma\'lumotlari hali kiritilmagan.\n\n';
+        }
+      } catch {
+        cardsMsg = '⚠️ Karta olishda xatolik.\n\n';
       }
 
-      let message = '🗑 *E\'lon o\'chirish*\n\n';
-      message += '📝 O\'chirmoqchi bo\'lgan e\'loningiz raqamini yuboring:\n\n';
-
-      userAds.forEach((ad, index) => {
-        const originalIndex = this.ads.findIndex(a => a.id === ad.id);
-        const preview = ad.content.length > 40
-          ? ad.content.substring(0, 40) + '...'
-          : ad.content;
-        message += `/${originalIndex + 1} - ${preview}\n\n`;
+      this.subscriptionFlows.set(userId, {
+        step: 'awaiting_receipt',
+        selectedPlan: planType,
+        amount: plan.price,
       });
 
-      this.awaitingAdCreation.add(userId);
-
-      ctx.reply(message, {
-        parse_mode: 'Markdown',
-        ...Markup.inlineKeyboard([
-          [Markup.button.callback('❌ Bekor qilish', 'cancel_delete')],
-        ]),
-      });
+      ctx.editMessageText(
+        `${plan.emoji} *${plan.name}* — ${plan.price.toLocaleString()} UZS\n\n` +
+        `📦 *Imkoniyatlar:*\n${plan.features.map(f => `   • ${f}`).join('\n')}\n\n` +
+        cardsMsg +
+        '📸 *Yuqoridagi kartaga pul o\'tkazing va chek rasmini yuboring.*\n\n' +
+        '⏳ Chek rasmini kutmoqda...',
+        {
+          parse_mode: 'Markdown',
+          ...Markup.inlineKeyboard([
+            [Markup.button.callback('❌ Bekor qilish', 'cancel_subscription')],
+          ]),
+        },
+      );
     });
 
-    // Help button
+    this.bot.action('cancel_subscription', (ctx) => {
+      const userId = ctx.from?.id;
+      if (userId) this.subscriptionFlows.delete(userId);
+      ctx.answerCbQuery('Bekor qilindi');
+      ctx.editMessageText('❌ Obuna bekor qilindi.');
+      ctx.reply('👇 Asosiy menyu:', this.getMainMenu());
+    });
+
+    // ========== 📚 YORDAM ==========
     this.bot.hears(/📚 Yordam/, (ctx) => {
       ctx.reply(
         '📚 *Yordam*\n\n' +
-        '🤖 Bu bot - reklama e\'lonlarini boshqarish uchun mo\'ljallangan.\n\n' +
-        '🔹 *Qanday ishlaydi:*\n' +
-        '1. "✍️ E\'lon yaratish" tugmasini bosing\n' +
-        '2. E\'lon matnini yuboring (misol: Плошатка керак...)\n' +
-        '3. "🚀 Tarqatishni boshlash" tugmasini bosing\n' +
-        '4. E\'lon raqamini yuboring\n\n' +
-        '⚙️ *Multi-Session:*\n' +
-        '• Barcha ulangan sessionlardagi guruhlarga tarqatadi\n' +
-        '• Guruhlar orasida: 0.5-5 soniya random\n' +
-        '• Roundlar orasida: 5-15 daqiqa random\n' +
-        '• Skip: 24 soat ichida yuborilgan guruhlar\n\n' +
-        '📞 *Yordam:* Admin bilan bog\'laning',
-        {
-          parse_mode: 'Markdown',
-          ...this.getMainMenu(),
-        }
+        '🔹 *Session ulash:*\n' +
+        '   📱 "Session ulash" → telefon raqam → kod → tayyor!\n' +
+        '   Bir nechta account ulash mumkin (10+ ta)\n\n' +
+        '🔹 *E\'lon tarqatish:*\n' +
+        '   1. E\'lon yaratish\n' +
+        '   2. "🚀 Tarqatishni boshlash"\n' +
+        '   3. Barcha sessionlardagi guruhlarga yuboriladi\n\n' +
+        '🔹 *Vaqtlar:*\n' +
+        '   • Guruhlar orasida: 0.5-5 soniya (random)\n' +
+        '   • Roundlar orasida: 10 daqiqa pauza\n\n' +
+        '🔹 *Obuna:*\n' +
+        '   💳 "Obuna / To\'lov" → tarif → chek → admin tasdiqlaydi\n\n' +
+        '📞 Savol bo\'lsa admin bilan bog\'laning.',
+        { parse_mode: 'Markdown', ...this.getMainMenu() },
       );
     });
 
-    // Cancel actions
+    // ========== CANCEL CALLBACKS ==========
     this.bot.action('cancel_session', (ctx) => {
       const userId = ctx.from?.id;
       if (userId) {
+        const pending = this.pendingSessions.get(userId);
+        if (pending?.sessionId) {
+          this.telegramService.cancelPendingAuth(pending.sessionId).catch(() => {});
+        }
         this.pendingSessions.delete(userId);
       }
       ctx.answerCbQuery('Bekor qilindi');
       ctx.reply('❌ Session ulash bekor qilindi.', this.getMainMenu());
     });
 
-    this.bot.action('cancel_create', (ctx) => {
+    this.bot.action('cancel_ad', (ctx) => {
       const userId = ctx.from?.id;
-      if (userId) {
-        this.awaitingAdCreation.delete(userId);
-      }
+      if (userId) this.awaitingAdText.delete(userId);
       ctx.answerCbQuery('Bekor qilindi');
-      ctx.reply('❌ E\'lon yaratish bekor qilindi.', this.getMainMenu());
+      ctx.reply("❌ E'lon yaratish bekor qilindi.", this.getMainMenu());
     });
 
-    this.bot.action('cancel_post_start', (ctx) => {
-      const userId = ctx.from?.id;
-      if (userId) {
-        this.awaitingAdCreation.delete(userId);
-      }
-      ctx.answerCbQuery('Bekor qilindi');
-      ctx.reply('❌ Tarqatish boshlash bekor qilindi.', this.getMainMenu());
-    });
-
-    this.bot.action('cancel_stop', (ctx) => {
-      const userId = ctx.from?.id;
-      if (userId) {
-        this.awaitingAdCreation.delete(userId);
-      }
-      ctx.answerCbQuery('Bekor qilindi');
-      ctx.reply('❌ To\'xtatish bekor qilindi.', this.getMainMenu());
-    });
-
-    this.bot.action('cancel_delete', (ctx) => {
-      const userId = ctx.from?.id;
-      if (userId) {
-        this.awaitingAdCreation.delete(userId);
-      }
-      ctx.answerCbQuery('Bekor qilindi');
-      ctx.reply('❌ E\'lon o\'chirish bekor qilindi.', this.getMainMenu());
-    });
-
-    // Back to main
     this.bot.action('back_to_main', (ctx) => {
+      const userId = ctx.from?.id;
+      if (userId) this.clearUserState(userId);
       ctx.answerCbQuery();
-      ctx.reply(
-        '◀️ *Asosiy menyu*\n\n' +
-        '👇 Quyidagi menudan kerakli bo\'limni tanlang:',
-        {
-          parse_mode: 'Markdown',
-          ...this.getMainMenu(),
-        }
-      );
+      ctx.reply('👇 Asosiy menyu:', this.getMainMenu());
     });
 
-    // Handle text messages
+    // ========== PHOTO HANDLER (chek rasm) ==========
+    this.bot.on(message('photo'), async (ctx) => {
+      const userId = ctx.from?.id;
+      if (!userId) return;
+
+      const flow = this.subscriptionFlows.get(userId);
+      if (!flow || flow.step !== 'awaiting_receipt') return;
+
+      try {
+        const receiptUrl = await this.downloadPhoto(ctx);
+        const user = await this.getOrCreateUser(ctx);
+        if (!user) {
+          ctx.reply('❌ Foydalanuvchi topilmadi.', this.getMainMenu());
+          this.subscriptionFlows.delete(userId);
+          return;
+        }
+
+        await this.paymentsService.create(
+          user.id,
+          flow.amount!,
+          flow.selectedPlan!,
+          { receiptImage: receiptUrl },
+        );
+
+        this.subscriptionFlows.delete(userId);
+
+        ctx.reply(
+          '✅ *To\'lovingiz qabul qilindi!*\n\n' +
+          `💰 *Summa:* ${flow.amount!.toLocaleString()} UZS\n` +
+          `📦 *Plan:* ${PLAN_INFO[flow.selectedPlan!].name}\n` +
+          '📸 *Chek:* Yuklandi\n\n' +
+          '⏳ *Admin tasdiqlashini kuting.*\n' +
+          'Tasdiqlangandan keyin obuna faollashadi.',
+          { parse_mode: 'Markdown', ...this.getMainMenu() },
+        );
+      } catch (error) {
+        this.logger.error(`Chek yuklashda xatolik: ${error.message}`);
+        this.subscriptionFlows.delete(userId);
+        ctx.reply('❌ Xatolik yuz berdi. Qayta urinib ko\'ring.', this.getMainMenu());
+      }
+    });
+
+    // ========== TEXT HANDLER ==========
     this.bot.on(message('text'), async (ctx) => {
       const userId = ctx.from?.id;
       const text = ctx.message.text;
-
       if (!userId) return;
 
-      // Check if user is creating a session
-      const pendingSession = this.pendingSessions.get(userId);
-      if (pendingSession) {
-        await this.handleSessionCreation(ctx, pendingSession, text);
+      // ===== Session ulash — telefon raqam / kod / parol =====
+      const pending = this.pendingSessions.get(userId);
+      if (pending) {
+        await this.handleSessionFlow(ctx, pending, text);
         return;
       }
 
-      // Check if user is creating an ad
-      if (this.awaitingAdCreation.has(userId)) {
-        this.awaitingAdCreation.delete(userId);
+      // ===== E'lon yaratish =====
+      if (this.awaitingAdText.has(userId)) {
+        this.awaitingAdText.delete(userId);
 
-        // Create new ad
-        const newAd: Ad = {
-          id: Date.now().toString(),
-          userId,
-          userName: ctx.from.first_name || 'Foydalanuvchi',
-          content: text,
-          createdAt: new Date(),
-          isPosting: false,
-        };
+        const user = await this.getOrCreateUser(ctx);
+        if (!user) {
+          ctx.reply('❌ Foydalanuvchi topilmadi.', this.getMainMenu());
+          return;
+        }
 
-        this.ads.push(newAd);
-
-        ctx.reply(
-          '✅ *E\'lon muvaffaqiyatli saqlandi!*\n\n' +
-          `📝 *E\'lon:*\n${text}\n\n` +
-          `📊 *Jami e\'lonlar:* ${this.ads.filter((a) => a.userId === userId).length} ta\n\n` +
-          '🚀 Tarqatishni boshlash uchun "🚀 Tarqatishni boshlash" tugmasini bosing.',
-          {
-            parse_mode: 'Markdown',
-            ...this.getMainMenu(),
-          }
-        );
-        return;
-      }
-
-      // Check if user is selecting an ad by number
-      if (text.startsWith('/') && /^\d+$/.test(text.substring(1))) {
-        const index = parseInt(text.substring(1)) - 1;
-
-        if (index >= 0 && index < this.ads.length) {
-          const ad = this.ads[index];
-
-          // Check if this ad belongs to the user
-          if (ad.userId !== userId) {
-            ctx.reply(
-              '❌ *Xatolik!*\n\n' +
-              '🔍 Bu e\'lon sizga tegishli emas.',
-              this.getMainMenu()
-            );
-            return;
-          }
+        try {
+          await this.prisma.ad.create({
+            data: {
+              userId: user.id,
+              title: text.slice(0, 50),
+              content: text,
+              mediaType: 'TEXT',
+              status: 'DRAFT',
+              createdBy: user.id,
+            },
+          });
 
           ctx.reply(
-            `📝 *Tanlangan e\'lon:*\n\n${ad.content}\n\n` +
-            '👇 Quyidagi amallardan birini tanlang:',
-            {
-              parse_mode: 'Markdown',
-              ...Markup.inlineKeyboard([
-                [Markup.button.callback('🚀 Tarqatishni boshlash', `start_posting_${ad.id}`)],
-                [Markup.button.callback('📊 Hisobot', `report_${ad.id}`)],
-                ad.isPosting ? [Markup.button.callback('⏸ To\'xtatish', `stop_posting_${ad.id}`)] : [],
-                !ad.isPosting ? [Markup.button.callback('🗑 O\'chirish', `delete_${ad.id}`)] : [],
-                [Markup.button.callback('◀️ Orqaga', 'back_to_main')],
-              ]),
-            }
+            '✅ *E\'lon saqlandi!*\n\n' +
+            `📝 ${text}\n\n` +
+            '🚀 Tarqatish uchun "🚀 Tarqatishni boshlash" tugmasini bosing.',
+            { parse_mode: 'Markdown', ...this.getMainMenu() },
           );
-        } else {
-          ctx.reply(
-            '❌ *Noto\'g\'ri raqam!*\n\n' +
-            '👇 Iltimos, to\'g\'ri raqamni tanlang:',
-            this.getMainMenu()
-          );
+        } catch (error) {
+          ctx.reply(`❌ Xatolik: ${error.message}`, this.getMainMenu());
         }
         return;
       }
 
-      // Default response
+      // Default
       ctx.reply(
-        '🤖 *Men sizga yordam bera olaman!*\n\n' +
-        '👇 Quyidagi menudan kerakli bo\'limni tanlang:',
-        {
-          parse_mode: 'Markdown',
-          ...this.getMainMenu(),
-        }
+        '👇 Quyidagi menudan tanlang:',
+        this.getMainMenu(),
       );
     });
 
-    // Start posting callback
-    this.bot.action(/start_posting_(.+)/, async (ctx) => {
-      const adId = ctx.match[1];
-      const ad = this.ads.find((a) => a.id === adId);
-
-      if (!ad) {
-        ctx.answerCbQuery('E\'lon topilmadi');
-        return;
-      }
-
-      if (ad.isPosting) {
-        ctx.answerCbQuery('Bu e\'lon allaqachon tarqatilmoqda');
-        return;
-      }
-
-      try {
-        ctx.answerCbQuery('🚀 Tarqatilmoqda...');
-
-        // Start posting
-        const job = await this.postingService.startPosting(
-          ad.id,
-          ad.content,
-          ad.userId.toString()
-        );
-
-        // Update ad
-        ad.isPosting = true;
-        ad.postingJobId = job.id;
-
-        const stats = this.postingService.getJobStats(job.id);
-
-        ctx.reply(
-          '✅ *Tarqatish boshlandi!*\n\n' +
-          `📊 *Jami guruhlar:* ${stats?.totalGroups || 0}\n` +
-          '⚙️ *Rejim:* Multi-session\n' +
-          '⏱️ *Delay:* 0.5-5s (guruhlar orasida), 5-15min (roundlar orasida)\n\n' +
-          '📈 Hisobotni ko\'rish uchun "📈 Hisobot" tugmasini bosing.\n' +
-          '⏸ To\'xtatish uchun "⏸ Tarqatishni to\'xtatish" tugmasini bosing.',
-          {
-            parse_mode: 'Markdown',
-            ...this.getMainMenu(),
-          }
-        );
-      } catch (error) {
-        ctx.reply(
-          '❌ *Xatolik yuz berdi!*\n\n' +
-          `🔴 ${error.message}\n\n` +
-          '⚠️ Iltimos, sessionlarni tekshiring.',
-          {
-            parse_mode: 'Markdown',
-            ...this.getMainMenu(),
-          }
-        );
-      }
-    });
-
-    // Stop posting callback
-    this.bot.action(/stop_posting_(.+)/, (ctx) => {
-      const adId = ctx.match[1];
-      const ad = this.ads.find((a) => a.id === adId);
-
-      if (!ad || !ad.postingJobId) {
-        ctx.answerCbQuery('E\'lon topilmadi');
-        return;
-      }
-
-      ctx.answerCbQuery('⏸ To\'xtatilmoqda...');
-
-      // Stop posting
-      this.postingService.stopJob(ad.postingJobId);
-
-      // Update ad
-      ad.isPosting = false;
-
-      const stats = this.postingService.getJobStats(ad.postingJobId);
-
-      ctx.reply(
-        '✅ *Tarqatish to\'xtatildi!*\n\n' +
-        `📊 *Yuborildi:* ${stats?.postedGroups || 0}\n` +
-        `❌ *Xatolik:* ${stats?.failedGroups || 0}\n` +
-        `⏭️ *O\'tkazildi:* ${stats?.skippedGroups || 0}\n` +
-        `🔄 *Roundlar:* ${stats?.roundsCompleted || 0}\n` +
-        `⏱️ *Vaqt:* ${stats ? Math.floor(stats.duration / 1000) : 0}s\n` +
-        `📈 *Muvaffaqiyat:* ${stats?.successRate.toFixed(1) || 0}%`,
-        {
-          parse_mode: 'Markdown',
-          ...this.getMainMenu(),
-        }
-      );
-    });
-
-    // Report callback
-    this.bot.action(/report_(.+)/, (ctx) => {
-      const adId = ctx.match[1];
-      const ad = this.ads.find((a) => a.id === adId);
-
-      if (!ad || !ad.postingJobId) {
-        ctx.answerCbQuery('Hisobot topilmadi');
-        return;
-      }
-
-      const job = this.postingService.getJob(ad.postingJobId);
-      if (!job) {
-        ctx.answerCbQuery('Hisobot topilmadi');
-        ctx.reply(
-          '❌ Hisobot topilmadi.',
-          this.getMainMenu()
-        );
-        return;
-      }
-
-      const stats = this.postingService.getJobStats(ad.postingJobId);
-      if (!stats) {
-        ctx.answerCbQuery('Hisobot topilmadi');
-        return;
-      }
-
-      const logs = this.postingService.getJobLogs(ad.postingJobId);
-
-      ctx.answerCbQuery();
-
-      let message = '📈 *Tarqatish hisoboti*\n\n';
-      message += `📝 *E\'lon:* ${ad.content.substring(0, 50)}...\n`;
-      message += `📊 *Holat:* ${job.status}\n`;
-      message += `✅ *Yuborildi:* ${stats.postedGroups}/${stats.totalGroups}\n`;
-      message += `❌ *Xatolik:* ${stats.failedGroups}\n`;
-      message += `⏭️ *O\'tkazildi:* ${stats.skippedGroups}\n`;
-      message += `🔄 *Roundlar:* ${stats.roundsCompleted}\n`;
-      message += `⏱️ *Vaqt:* ${Math.floor(stats.duration / 1000)}s\n`;
-      message += `📈 *Muvaffaqiyat:* ${stats.successRate.toFixed(1)}%\n\n`;
-
-      if (logs.length > 0) {
-        message += '*📋 Oxirgi yuborishlar:*\n';
-        const recentLogs = logs.slice(-5);
-        for (const log of recentLogs) {
-          const emoji = log.status === 'success' ? '✅' : log.status === 'failed' ? '❌' : '⏭️';
-          message += `${emoji} ${log.groupName}\n`;
-          if (log.reason) message += `   (${log.reason})\n`;
-        }
-      }
-
-      ctx.reply(message, {
-        parse_mode: 'Markdown',
-        ...this.getMainMenu(),
-      });
-    });
-
-    // Delete ad callback
-    this.bot.action(/delete_(.+)/, (ctx) => {
-      const adId = ctx.match[1];
-      const adIndex = this.ads.findIndex((a) => a.id === adId);
-
-      if (adIndex === -1) {
-        ctx.answerCbQuery('E\'lon topilmadi');
-        return;
-      }
-
-      const ad = this.ads[adIndex];
-      if (ad.isPosting) {
-        ctx.answerCbQuery('Tarqatilmoqda bo\'lgan e\'lonni o\'chirib bo\'lmaydi');
-        return;
-      }
-
-      this.ads.splice(adIndex, 1);
-
-      ctx.answerCbQuery('E\'lon o\'chirildi');
-
-      ctx.reply(
-        '✅ *E\'lon muvaffaqiyatli o\'chirildi!*\n\n' +
-        `📊 *Qolgan e\'lonlar:* ${this.ads.filter((a) => a.userId === ctx.from?.id).length} ta`,
-        {
-          parse_mode: 'Markdown',
-          ...this.getMainMenu(),
-        }
-      );
-    });
-
-    // Handle generic callback queries
+    // Generic callback
     this.bot.on('callback_query', (ctx) => {
       if (!('data' in ctx.callbackQuery) || !ctx.callbackQuery.data) {
-        ctx.answerCbQuery('⚠️ Bu funksiya hozircha ishlamaydi');
+        ctx.answerCbQuery('⚠️ Noma\'lum buyruq');
       }
     });
   }
 
-  /**
-   * Handle session creation steps
-   */
-  private async handleSessionCreation(
-    ctx: any,
-    pending: SessionCreation,
-    text: string,
-  ): Promise<void> {
+  // ==================== SESSION FLOW ====================
+
+  private async handleSessionFlow(ctx: any, pending: SessionCreation, text: string): Promise<void> {
     const userId = ctx.from?.id;
     if (!userId) return;
 
     try {
       switch (pending.step) {
-        case 'phone':
-          // Validate phone number
-          const phone = text.replace(/\D/g, '');
-          if (phone.length < 10) {
+        case 'phone': {
+          // Telefon raqamni validatsiya
+          const phone = text.replace(/[\s\-\(\)]/g, '');
+          if (!/^\+?\d{10,15}$/.test(phone)) {
             ctx.reply(
-              '❌ *Noto\'g\'ri telefon raqami!*\n\n' +
-              '📝 Iltimos, to\'g\'ri formatda yuboring:\n' +
-              '• `998901234567`\n' +
-              '• `+998901234567`\n' +
-              '• `998 90 123 45 67`',
-              { parse_mode: 'Markdown' }
+              '❌ *Noto\'g\'ri format!*\n\n' +
+              'To\'g\'ri format: `+998901234567`\n\n' +
+              'Qayta yuboring:',
+              { parse_mode: 'Markdown' },
             );
             return;
           }
 
-          // Request code
+          const fullPhone = phone.startsWith('+') ? phone : '+' + phone;
+
+          ctx.reply(`📱 *${fullPhone}* ga kod yuborilmoqda...`, { parse_mode: 'Markdown' });
+
+          // Foydalanuvchini olish
+          const user = await this.getOrCreateUser(ctx);
+          if (!user) {
+            ctx.reply('❌ Foydalanuvchi topilmadi.', this.getMainMenu());
+            this.pendingSessions.delete(userId);
+            return;
+          }
+
+          // Real Telegram API orqali kod yuborish
+          const result = await this.telegramService.sendCode(user.id, fullPhone);
+
+          this.pendingSessions.set(userId, {
+            step: 'code',
+            phone: fullPhone,
+            sessionId: result.sessionId,
+          });
+
           ctx.reply(
-            '📱 *Kod yuborildi!*\n\n' +
-            '🔐 Telegramdan kelgan kodni yuboring:\n\n' +
+            '✅ *Kod yuborildi!*\n\n' +
+            '🔐 Telegram ilovangizga kelgan kodni yuboring:\n\n' +
             '⏳ Kodni kutmoqda...',
             {
               parse_mode: 'Markdown',
               ...Markup.inlineKeyboard([
                 [Markup.button.callback('❌ Bekor qilish', 'cancel_session')],
               ]),
-            }
+            },
           );
-
-          // Update pending session
-          this.pendingSessions.set(userId, {
-            ...pending,
-            step: 'code',
-            phone,
-            phoneCodeHash: 'temp_hash', // This would come from actual Telegram API
-          });
-
-          // Note: In real implementation, you would call TelegramService.authorizeSession here
-          this.logger.log(`Session creation started for phone: ${phone}`);
           break;
+        }
 
-        case 'code':
-          ctx.reply(
-            '✅ *Session muvaffaqiyatli ulandi!*\n\n' +
-            '🔐 Session saqlandi.\n\n' +
-            '⚠️ *Eslatma:* Database yo\'qligi sababli, session test rejimda saqlanadi.\n\n' +
-            '📋 Sessionlarni ko\'rish uchun "📋 Mening sessionlarim" tugmasini bosing.',
-            {
-              parse_mode: 'Markdown',
-              ...this.getMainMenu(),
+        case 'code': {
+          const code = text.replace(/\s/g, '');
+          if (!/^\d{5}$/.test(code)) {
+            ctx.reply(
+              '❌ Kod 5 ta raqamdan iborat bo\'lishi kerak.\nQayta yuboring:',
+            );
+            return;
+          }
+
+          ctx.reply('🔐 Kod tekshirilmoqda...');
+
+          try {
+            const result = await this.telegramService.signIn(pending.sessionId!, code);
+
+            this.pendingSessions.delete(userId);
+
+            ctx.reply(
+              '✅ *Session muvaffaqiyatli ulandi!*\n\n' +
+              `📊 *Guruhlar:* ${result.groupsCount} ta\n\n` +
+              '📋 "📋 Mening sessionlarim" — barchani ko\'ring\n' +
+              '🚀 Endi e\'lon tarqatishingiz mumkin!',
+              { parse_mode: 'Markdown', ...this.getMainMenu() },
+            );
+          } catch (error: any) {
+            if (error.message === '2FA_REQUIRED') {
+              this.pendingSessions.set(userId, {
+                ...pending,
+                step: 'password',
+              });
+              ctx.reply(
+                '🔒 *2FA parol kerak!*\n\n' +
+                'Telegram hisobingizning 2FA parolini yuboring:',
+                {
+                  parse_mode: 'Markdown',
+                  ...Markup.inlineKeyboard([
+                    [Markup.button.callback('❌ Bekor qilish', 'cancel_session')],
+                  ]),
+                },
+              );
+            } else {
+              this.pendingSessions.delete(userId);
+              ctx.reply(`❌ Xatolik: ${error.message}`, this.getMainMenu());
             }
-          );
-
-          // Clear pending session
-          this.pendingSessions.delete(userId);
-
-          // Note: In real implementation, you would call TelegramService.verifyCode here
-          this.logger.log(`Session created for user ${userId}`);
+          }
           break;
+        }
+
+        case 'password': {
+          ctx.reply('🔒 Parol tekshirilmoqda...');
+
+          try {
+            const result = await this.telegramService.signIn(pending.sessionId!, '', text);
+
+            this.pendingSessions.delete(userId);
+
+            ctx.reply(
+              '✅ *Session muvaffaqiyatli ulandi!*\n\n' +
+              `📊 *Guruhlar:* ${result.groupsCount} ta`,
+              { parse_mode: 'Markdown', ...this.getMainMenu() },
+            );
+          } catch (error: any) {
+            this.pendingSessions.delete(userId);
+            ctx.reply(`❌ Xatolik: ${error.message}`, this.getMainMenu());
+          }
+          break;
+        }
 
         default:
           this.pendingSessions.delete(userId);
-          ctx.reply('❌ Xatolik yuz berdi. Qayta urinib ko\'ring.', this.getMainMenu());
+          ctx.reply('❌ Xatolik. Qayta urinib ko\'ring.', this.getMainMenu());
       }
-    } catch (error) {
+    } catch (error: any) {
       this.pendingSessions.delete(userId);
-      ctx.reply(
-        '❌ *Xatolik yuz berdi!*\n\n' +
-        `🔴 ${error.message}\n\n` +
-        '⚠️ Iltimos, qayta urinib ko\'ring.',
-        {
-          parse_mode: 'Markdown',
-          ...this.getMainMenu(),
-        }
-      );
+      this.logger.error(`Session flow xatolik: ${error.message}`);
+      ctx.reply(`❌ Xatolik: ${error.message}`, this.getMainMenu());
     }
+  }
+
+  // ==================== STATE CLEANUP ====================
+
+  private clearUserState(userId: number) {
+    this.pendingSessions.delete(userId);
+    this.subscriptionFlows.delete(userId);
+    this.awaitingAdText.delete(userId);
   }
 }

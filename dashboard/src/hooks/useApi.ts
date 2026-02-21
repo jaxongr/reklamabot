@@ -13,6 +13,7 @@ import type {
   PaymentStatistics,
   Subscription,
   PlanDetails,
+  PaymentCard,
   AdStatus,
   PostStatus,
   PaymentStatus,
@@ -315,6 +316,43 @@ export const useRejectPayment = () => {
       return response.data
     },
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['payments'] }),
+  })
+}
+
+// ===================== SYSTEM CONFIG =====================
+
+export const usePaymentCards = () =>
+  useQuery<PaymentCard[]>({
+    queryKey: ['config', 'payment-cards'],
+    queryFn: async () => {
+      const response = await api.get('/config/payment-cards')
+      return response.data
+    },
+  })
+
+export const useUpdatePaymentCards = () => {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async (cards: PaymentCard[]) => {
+      const response = await api.put('/config/payment-cards', { cards })
+      return response.data
+    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['config', 'payment-cards'] }),
+  })
+}
+
+// ===================== UPLOAD =====================
+
+export const useUploadReceipt = () => {
+  return useMutation({
+    mutationFn: async (file: File) => {
+      const formData = new FormData()
+      formData.append('file', file)
+      const response = await api.post('/upload/receipt', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      })
+      return response.data as { url: string; filename: string; size: number }
+    },
   })
 }
 
