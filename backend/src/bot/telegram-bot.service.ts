@@ -931,10 +931,13 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy, Before
         }
 
         case 'code': {
-          const code = text.replace(/[\s\-]/g, '');
-          if (!/^\d{4,6}$/.test(code)) {
+          // Faqat raqamlarni ajratib olish (harflar, bo'shliqlar, tire olib tashlanadi)
+          const code = text.replace(/[^0-9]/g, '');
+          if (code.length < 4 || code.length > 6) {
             ctx.reply(
-              '❌ Kod 4-6 ta raqamdan iborat bo\'lishi kerak.\nQayta yuboring:',
+              '❌ Kod 4-6 ta raqamdan iborat bo\'lishi kerak.\n' +
+              'Agar kodda harflar bo\'lsa, shunday yuboring — raqamlarni o\'zimiz ajratamiz.\n' +
+              'Qayta yuboring:',
             );
             return;
           }
@@ -969,6 +972,20 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy, Before
                   ]),
                 },
               );
+            } else if (error.message === 'RESEND_CODE') {
+              // Kod muddati o'tgan — yangi kod yuborildi
+              ctx.reply(
+                '⏳ *Kod muddati o\'tgan!*\n\n' +
+                '📱 Yangi kod qayta yuborildi.\n' +
+                'Yangi kodni yuboring:',
+                {
+                  parse_mode: 'Markdown',
+                  ...Markup.inlineKeyboard([
+                    [Markup.button.callback('❌ Bekor qilish', 'cancel_session')],
+                  ]),
+                },
+              );
+              // step 'code' da qolamiz
             } else if (error.message.includes('noto') || error.message.includes('INVALID')) {
               // Kod noto'g'ri — qayta kiritish imkoniyati
               ctx.reply(

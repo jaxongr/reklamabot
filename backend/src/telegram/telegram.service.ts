@@ -170,11 +170,33 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
           } else if (error.errorMessage === 'PHONE_CODE_INVALID') {
             throw new Error('Kod noto\'g\'ri. Qayta tekshiring.');
           } else if (error.errorMessage === 'PHONE_CODE_EXPIRED') {
-            // Pending auth ni tozalash
-            this.pendingAuths.delete(sessionId);
-            await client.disconnect().catch(() => {});
-            await this.prisma.session.delete({ where: { id: sessionId } }).catch(() => {});
-            throw new Error('Kod muddati o\'tgan. Qayta telefon raqam yuboring.');
+            // Kodni qayta yuborish
+            this.logger.log(`Kod muddati o'tgan, qayta yuborilmoqda: ${phone}`);
+            try {
+              const resendResult = await client.invoke(
+                new Api.auth.ResendCode({
+                  phoneNumber: phone,
+                  phoneCodeHash,
+                }),
+              );
+              const newHash = (resendResult as any).phoneCodeHash;
+              // Pending auth ni yangilash
+              this.pendingAuths.set(sessionId, {
+                client,
+                phone,
+                phoneCodeHash: newHash,
+                sessionId,
+              });
+              throw new Error('RESEND_CODE');
+            } catch (resendError: any) {
+              if (resendError.message === 'RESEND_CODE') throw resendError;
+              // Resend ham ishlamasa — tozalash
+              this.logger.error(`Kodni qayta yuborishda xatolik: ${resendError.message}`);
+              this.pendingAuths.delete(sessionId);
+              await client.disconnect().catch(() => {});
+              await this.prisma.session.delete({ where: { id: sessionId } }).catch(() => {});
+              throw new Error('Kod muddati o\'tgan. Qayta telefon raqam yuboring.');
+            }
           } else {
             throw error;
           }
@@ -205,6 +227,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       return { success: true, groupsCount };
     } catch (error: any) {
       if (error.message === '2FA_REQUIRED') throw error;
+      if (error.message === 'RESEND_CODE') throw error;
       if (error.message.includes('Kod noto\'g\'ri')) throw error;
       if (error.message.includes('Kod muddati')) throw error;
 
