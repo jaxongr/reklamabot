@@ -57,14 +57,16 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy, Before
       const botInfo = await this.bot.telegram.getMe();
       this.logger.log(`Bot connected: @${botInfo.username} (${botInfo.first_name})`);
 
-      // Start polling
+      // Start polling (non-blocking)
       this.logger.log('Starting bot polling...');
-      await this.bot.launch({
+      this.bot.launch({
         dropPendingUpdates: true,
+      }).then(() => {
+        this.isBotRunning = true;
+        this.logger.log('Telegram bot started successfully!');
+      }).catch((err) => {
+        this.logger.error('Bot launch error:', err.message);
       });
-
-      this.isBotRunning = true;
-      this.logger.log('Telegram bot started successfully!');
     } catch (error) {
       this.logger.error('Failed to start Telegram bot:', error.message);
       this.logger.warn('Bot will not respond to commands.');
