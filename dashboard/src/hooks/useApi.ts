@@ -387,6 +387,29 @@ export const useMySubscription = () =>
     },
   })
 
+export const useConfigSubscriptionPlans = () =>
+  useQuery<Array<PlanDetails & { type: string }> | null>({
+    queryKey: ['config', 'subscription-plans'],
+    queryFn: async () => {
+      const response = await api.get('/config/subscription-plans')
+      return response.data
+    },
+  })
+
+export const useUpdateSubscriptionPlans = () => {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async (plans: Array<PlanDetails & { type: string }>) => {
+      const response = await api.put('/config/subscription-plans', { plans })
+      return response.data
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['config', 'subscription-plans'] })
+      queryClient.invalidateQueries({ queryKey: ['subscriptions', 'plans'] })
+    },
+  })
+}
+
 // ===================== USER =====================
 
 export const useProfile = () =>

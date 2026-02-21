@@ -6,7 +6,7 @@ import {
   Param,
   UseGuards,
 } from '@nestjs/common';
-import { SystemConfigService, PaymentCard } from './system-config.service';
+import { SystemConfigService, PaymentCard, SubscriptionPlanConfig } from './system-config.service';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../auth/decorators/roles.decorator';
@@ -33,6 +33,21 @@ export class SystemConfigController {
   @ApiOperation({ summary: "To'lov kartalarini yangilash (admin)" })
   async updatePaymentCards(@Body() body: { cards: PaymentCard[] }) {
     await this.configService.setPaymentCards(body.cards);
+    return { success: true };
+  }
+
+  @Get('subscription-plans')
+  @Public()
+  @ApiOperation({ summary: 'Obuna tariflarini olish' })
+  async getSubscriptionPlans() {
+    return this.configService.getSubscriptionPlans();
+  }
+
+  @Put('subscription-plans')
+  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  @ApiOperation({ summary: 'Obuna tariflarini yangilash (admin)' })
+  async updateSubscriptionPlans(@Body() body: { plans: SubscriptionPlanConfig[] }) {
+    await this.configService.setSubscriptionPlans(body.plans);
     return { success: true };
   }
 

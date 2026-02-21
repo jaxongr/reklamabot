@@ -3,6 +3,7 @@ import {
   Card,
   Form,
   Input,
+  InputNumber,
   Typography,
   Button,
   Row,
@@ -13,6 +14,7 @@ import {
   Space,
   List,
   Popconfirm,
+  Table,
 } from 'antd'
 import {
   SaveOutlined,
@@ -20,6 +22,7 @@ import {
   DeleteOutlined,
   CreditCardOutlined,
   BankOutlined,
+  DollarOutlined,
 } from '@ant-design/icons'
 import styled from 'styled-components'
 import {
@@ -28,9 +31,11 @@ import {
   useMySubscription,
   usePaymentCards,
   useUpdatePaymentCards,
+  useSubscriptionPlans,
+  useUpdateSubscriptionPlans,
 } from '../../hooks/useApi'
 import { useAuthStore } from '../../stores/authStore'
-import type { PaymentCard } from '../../types'
+import type { PaymentCard, PlanDetails } from '../../types'
 
 const { Title, Text } = Typography
 
@@ -70,6 +75,12 @@ const Settings = () => {
   const [cards, setCards] = useState<PaymentCard[]>([])
   const [cardForm] = Form.useForm()
 
+  // Tarif boshqaruv
+  const { data: plans, isLoading: plansLoading } = useSubscriptionPlans()
+  const updatePlansMutation = useUpdateSubscriptionPlans()
+  const [editingPlans, setEditingPlans] = useState<Array<PlanDetails & { type: string }>>([])
+  const [plansEdited, setPlansEdited] = useState(false)
+
   const [form] = Form.useForm()
 
   useEffect(() => {
@@ -83,6 +94,12 @@ const Settings = () => {
       setCards(paymentCards)
     }
   }, [paymentCards])
+
+  useEffect(() => {
+    if (plans) {
+      setEditingPlans(plans.map((p) => ({ ...p })))
+    }
+  }, [plans])
 
   const handleSave = async (values: any) => {
     try {
@@ -100,6 +117,23 @@ const Settings = () => {
       setCards(newCards)
       cardForm.resetFields()
       message.success('Karta qo\'shildi')
+    } catch {
+      message.error('Xatolik yuz berdi')
+    }
+  }
+
+  const handlePlanChange = (index: number, field: string, value: number | string) => {
+    const updated = [...editingPlans]
+    ;(updated[index] as any)[field] = value
+    setEditingPlans(updated)
+    setPlansEdited(true)
+  }
+
+  const handleSavePlans = async () => {
+    try {
+      await updatePlansMutation.mutateAsync(editingPlans)
+      setPlansEdited(false)
+      message.success('Tariflar saqlandi!')
     } catch {
       message.error('Xatolik yuz berdi')
     }
@@ -279,6 +313,128 @@ const Settings = () => {
             </StyledCard>
           )}
         </Col>
+
+        {/* Admin uchun — Tariflar boshqaruvi */}
+          {isAdmin && (
+            <StyledCard
+              title={
+                <Space>
+                  <DollarOutlined />
+                  <span>Tariflar Boshqaruvi</span>
+                </Space>
+              }
+              loading={plansLoading}
+              style={{ marginTop: 24 }}
+              extra={
+                plansEdited && (
+                  <Button
+                    type="primary"
+                    icon={<SaveOutlined />}
+                    onClick={handleSavePlans}
+                    loading={updatePlansMutation.isPending}
+                  >
+                    Saqlash
+                  </Button>
+                )
+              }
+            >
+              <Table
+                dataSource={editingPlans}
+                rowKey="type"
+                pagination={false}
+                size="small"
+                scroll={{ x: 800 }}
+                columns={[
+                  {
+                    title: 'Tarif',
+                    dataIndex: 'name',
+                    width: 120,
+                    render: (name: string, _: unknown, index: number) => (
+                      <Input
+                        value={name}
+                        onChange={(e) => handlePlanChange(index, 'name', e.target.value)}
+                        size="small"
+                      />
+                    ),
+                  },
+                  {
+                    title: 'Narxi (UZS)',
+                    dataIndex: 'price',
+                    width: 130,
+                    render: (price: number, _: unknown, index: number) => (
+                      <InputNumber
+                        value={price}
+                        onChange={(v) => handlePlanChange(index, 'price', v || 0)}
+                        size="small"
+                        style={{ width: '100%' }}
+                        formatter={(v) => `${v}`.replace(/\B(?=(\d{3})+(?!\d))/g, ',')}
+                      />
+                    ),
+                  },
+                  {
+                    title: 'Muddat (kun)',
+                    dataIndex: 'durationDays',
+                    width: 100,
+                    render: (val: number, _: unknown, index: number) => (
+                      <InputNumber
+                        value={val}
+                        onChange={(v) => handlePlanChange(index, 'durationDays', v || 30)}
+                        size="small"
+                        min={1}
+                        style={{ width: '100%' }}
+                      />
+                    ),
+                  },
+                  {
+                    title: 'Max E\'lon',
+                    dataIndex: 'maxAds',
+                    width: 100,
+                    render: (val: number, _: unknown, index: number) => (
+                      <InputNumber
+                        value={val}
+                        onChange={(v) => handlePlanChange(index, 'maxAds', v ?? -1)}
+                        size="small"
+                        min={-1}
+                        style={{ width: '100%' }}
+                        placeholder="-1=cheksiz"
+                      />
+                    ),
+                  },
+                  {
+                    title: 'Max Session',
+                    dataIndex: 'maxSessions',
+                    width: 100,
+                    render: (val: number, _: unknown, index: number) => (
+                      <InputNumber
+                        value={val}
+                        onChange={(v) => handlePlanChange(index, 'maxSessions', v ?? -1)}
+                        size="small"
+                        min={-1}
+                        style={{ width: '100%' }}
+                      />
+                    ),
+                  },
+                  {
+                    title: 'Max Guruh',
+                    dataIndex: 'maxGroups',
+                    width: 100,
+                    render: (val: number, _: unknown, index: number) => (
+                      <InputNumber
+                        value={val}
+                        onChange={(v) => handlePlanChange(index, 'maxGroups', v ?? -1)}
+                        size="small"
+                        min={-1}
+                        style={{ width: '100%' }}
+                      />
+                    ),
+                  },
+                ]}
+              />
+              <div style={{ marginTop: 8, color: '#999', fontSize: 12 }}>
+                -1 = cheksiz. O'zgartirganingizdan keyin "Saqlash" tugmasini bosing.
+              </div>
+            </StyledCard>
+          )}
 
         <Col xs={24} lg={10}>
           <StyledCard title="Hisob Ma'lumotlari">

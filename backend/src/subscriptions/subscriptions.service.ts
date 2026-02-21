@@ -1,5 +1,6 @@
 import { Injectable, NotFoundException, BadRequestException, Logger } from '@nestjs/common';
 import { PrismaService } from '../common/prisma.service';
+import { SystemConfigService } from '../common/system-config.service';
 import { SubscriptionPlan, SubscriptionStatus } from '@prisma/client';
 
 const PLAN_DETAILS: Record<SubscriptionPlan, {
@@ -18,9 +19,9 @@ const PLAN_DETAILS: Record<SubscriptionPlan, {
     name: 'Starter',
     price: 50000,
     currency: 'UZS',
-    maxAds: 5,
-    maxSessions: 1,
-    maxGroups: 50,
+    maxAds: -1,
+    maxSessions: -1,
+    maxGroups: -1,
     minInterval: 600,
     maxInterval: 1800,
     groupInterval: 5,
@@ -30,9 +31,9 @@ const PLAN_DETAILS: Record<SubscriptionPlan, {
     name: 'Business',
     price: 150000,
     currency: 'UZS',
-    maxAds: 20,
-    maxSessions: 3,
-    maxGroups: 200,
+    maxAds: -1,
+    maxSessions: -1,
+    maxGroups: -1,
     minInterval: 300,
     maxInterval: 900,
     groupInterval: 3,
@@ -42,9 +43,9 @@ const PLAN_DETAILS: Record<SubscriptionPlan, {
     name: 'Premium',
     price: 300000,
     currency: 'UZS',
-    maxAds: 50,
-    maxSessions: 5,
-    maxGroups: 500,
+    maxAds: -1,
+    maxSessions: -1,
+    maxGroups: -1,
     minInterval: 180,
     maxInterval: 600,
     groupInterval: 2,
@@ -55,7 +56,7 @@ const PLAN_DETAILS: Record<SubscriptionPlan, {
     price: 500000,
     currency: 'UZS',
     maxAds: -1,
-    maxSessions: 10,
+    maxSessions: -1,
     maxGroups: -1,
     minInterval: 60,
     maxInterval: 300,
@@ -68,7 +69,10 @@ const PLAN_DETAILS: Record<SubscriptionPlan, {
 export class SubscriptionsService {
   private readonly logger = new Logger(SubscriptionsService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly systemConfig: SystemConfigService,
+  ) {}
 
   async create(userId: string, planType: SubscriptionPlan) {
     const existing = await this.prisma.subscription.findUnique({
@@ -300,7 +304,16 @@ export class SubscriptionsService {
     return PLAN_DETAILS[planType];
   }
 
-  getAllPlans() {
+  async getAllPlans() {
+    // SystemConfig dan custom planlarni tekshirish
+    try {
+      const customPlans = await this.systemConfig.getSubscriptionPlans();
+      if (customPlans && customPlans.length > 0) {
+        return customPlans;
+      }
+    } catch {}
+
+    // Default planlarni qaytarish
     return Object.entries(PLAN_DETAILS).map(([key, value]) => ({
       type: key,
       ...value,

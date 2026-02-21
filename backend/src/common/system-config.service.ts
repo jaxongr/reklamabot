@@ -63,13 +63,36 @@ export class SystemConfigService {
     );
   }
 
-  async getSubscriptionPrices(): Promise<Record<string, number> | null> {
-    const value = await this.get('subscription_prices');
+  async getSubscriptionPlans(): Promise<SubscriptionPlanConfig[] | null> {
+    const value = await this.get('subscription_plans');
     if (!value) return null;
     try {
-      return JSON.parse(value);
+      return JSON.parse(value) as SubscriptionPlanConfig[];
     } catch {
       return null;
     }
   }
+
+  async setSubscriptionPlans(plans: SubscriptionPlanConfig[]) {
+    return this.set(
+      'subscription_plans',
+      JSON.stringify(plans),
+      ConfigType.JSON,
+      'Obuna tariflari sozlamalari',
+    );
+  }
+}
+
+export interface SubscriptionPlanConfig {
+  type: string;
+  name: string;
+  price: number;
+  currency: string;
+  maxAds: number;
+  maxSessions: number;
+  maxGroups: number;
+  minInterval: number;
+  maxInterval: number;
+  groupInterval: number;
+  durationDays: number;
 }

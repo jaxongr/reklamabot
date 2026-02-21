@@ -931,10 +931,10 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy, Before
         }
 
         case 'code': {
-          const code = text.replace(/\s/g, '');
-          if (!/^\d{5}$/.test(code)) {
+          const code = text.replace(/[\s\-]/g, '');
+          if (!/^\d{4,6}$/.test(code)) {
             ctx.reply(
-              '❌ Kod 5 ta raqamdan iborat bo\'lishi kerak.\nQayta yuboring:',
+              '❌ Kod 4-6 ta raqamdan iborat bo\'lishi kerak.\nQayta yuboring:',
             );
             return;
           }
@@ -962,6 +962,17 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy, Before
               ctx.reply(
                 '🔒 *2FA parol kerak!*\n\n' +
                 'Telegram hisobingizning 2FA parolini yuboring:',
+                {
+                  parse_mode: 'Markdown',
+                  ...Markup.inlineKeyboard([
+                    [Markup.button.callback('❌ Bekor qilish', 'cancel_session')],
+                  ]),
+                },
+              );
+            } else if (error.message.includes('noto') || error.message.includes('INVALID')) {
+              // Kod noto'g'ri — qayta kiritish imkoniyati
+              ctx.reply(
+                '❌ *Kod noto\'g\'ri!* Qayta yuboring:',
                 {
                   parse_mode: 'Markdown',
                   ...Markup.inlineKeyboard([

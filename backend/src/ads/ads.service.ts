@@ -102,7 +102,7 @@ export class AdsService {
         where,
         skip,
         take,
-        orderBy: { isPriority: 'desc', createdAt: 'desc' },
+        orderBy: [{ isPriority: 'desc' }, { createdAt: 'desc' }],
       }),
       this.prisma.ad.count({ where }),
     ]);

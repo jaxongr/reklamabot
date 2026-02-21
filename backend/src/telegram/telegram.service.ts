@@ -1,6 +1,7 @@
 import { Injectable, Logger, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
 import { TelegramClient, Api } from 'telegram';
 import { StringSession } from 'telegram/sessions';
+import { computeCheck } from 'telegram/Password';
 import { PrismaService } from '../common/prisma.service';
 import { ConfigService } from '@nestjs/config';
 import { SessionStatus } from '@prisma/client';
@@ -130,33 +131,53 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     const { client, phone, phoneCodeHash } = pending;
 
     try {
-      // Kod bilan sign in
-      try {
-        await client.invoke(
-          new Api.auth.SignIn({
-            phoneNumber: phone,
-            phoneCodeHash,
-            phoneCode: code,
+      // Faqat parol kelgan bo'lsa — 2FA checkPassword
+      if (password && !code) {
+        this.logger.log(`2FA parol bilan kirish: ${sessionId}`);
+        const srpPassword = await client.invoke(new Api.account.GetPassword());
+        const passwordSrpResult = await client.invoke(
+          new Api.auth.CheckPassword({
+            password: await computeCheck(srpPassword, password),
           }),
         );
-      } catch (error: any) {
-        // 2FA parol kerak
-        if (error.errorMessage === 'SESSION_PASSWORD_NEEDED') {
-          if (!password) {
-            throw new Error('2FA_REQUIRED');
+        this.logger.log(`2FA muvaffaqiyatli: ${sessionId}`);
+      } else {
+        // Kod bilan sign in
+        this.logger.log(`Kod bilan sign in: ${sessionId}, kod: ${code}`);
+        try {
+          await client.invoke(
+            new Api.auth.SignIn({
+              phoneNumber: phone,
+              phoneCodeHash,
+              phoneCode: code,
+            }),
+          );
+        } catch (error: any) {
+          this.logger.error(`SignIn xatolik: errorMessage=${error.errorMessage}, message=${error.message}`);
+
+          // 2FA parol kerak
+          if (error.errorMessage === 'SESSION_PASSWORD_NEEDED') {
+            if (!password) {
+              throw new Error('2FA_REQUIRED');
+            }
+            // 2FA parol bilan checkPassword
+            const srpPassword = await client.invoke(new Api.account.GetPassword());
+            await client.invoke(
+              new Api.auth.CheckPassword({
+                password: await computeCheck(srpPassword, password),
+              }),
+            );
+          } else if (error.errorMessage === 'PHONE_CODE_INVALID') {
+            throw new Error('Kod noto\'g\'ri. Qayta tekshiring.');
+          } else if (error.errorMessage === 'PHONE_CODE_EXPIRED') {
+            // Pending auth ni tozalash
+            this.pendingAuths.delete(sessionId);
+            await client.disconnect().catch(() => {});
+            await this.prisma.session.delete({ where: { id: sessionId } }).catch(() => {});
+            throw new Error('Kod muddati o\'tgan. Qayta telefon raqam yuboring.');
+          } else {
+            throw error;
           }
-          // 2FA parol bilan sign in — client.start() yordamida
-          await client.start({
-            phoneNumber: phone,
-            phoneCode: async () => code,
-            password: async () => password,
-            onError: async (err) => {
-              this.logger.error('2FA auth error:', err.message);
-              return true;
-            },
-          });
-        } else {
-          throw error;
         }
       }
 
@@ -184,6 +205,8 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       return { success: true, groupsCount };
     } catch (error: any) {
       if (error.message === '2FA_REQUIRED') throw error;
+      if (error.message.includes('Kod noto\'g\'ri')) throw error;
+      if (error.message.includes('Kod muddati')) throw error;
 
       this.pendingAuths.delete(sessionId);
       await client.disconnect().catch(() => {});
@@ -191,7 +214,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       // Xatolik bo'lsa sessionni o'chirish
       await this.prisma.session.delete({ where: { id: sessionId } }).catch(() => {});
 
-      this.logger.error(`Sign in xatolik: ${error.message}`);
+      this.logger.error(`Sign in xatolik: ${error.errorMessage || error.message}`);
       throw new Error(`Kirishda xatolik: ${error.errorMessage || error.message}`);
     }
   }
