@@ -1,9 +1,8 @@
-import { useState } from 'react'
-import { useNavigate } from 'react-router-dom'
 import { Form, Input, Button, Card, Typography, message, Space } from 'antd'
 import { UserOutlined, LockOutlined } from '@ant-design/icons'
 import styled from 'styled-components'
 import { useAuthStore } from '../../stores/authStore'
+import { useNavigate } from 'react-router-dom'
 
 const { Title, Paragraph } = Typography
 
@@ -18,24 +17,22 @@ const StyledContainer = styled.div`
 
 const StyledCard = styled(Card)`
   width: 100%;
-  max-width: 400px;
+  max-width: 420px;
   border-radius: 16px;
   box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
 `
 
 const Login = () => {
   const navigate = useNavigate()
-  const { login, isLoading } = useAuthStore()
-  const [telegramId, setTelegramId] = useState('')
-  const [authData, setAuthData] = useState('')
+  const { adminLogin, isLoading } = useAuthStore()
 
-  const handleSubmit = async (values: any) => {
+  const handleSubmit = async (values: { username: string; password: string }) => {
     try {
-      await login(values.telegramId, values.authData)
+      await adminLogin(values.username, values.password)
       message.success('Muvaffaqiyatli kirishdingiz!')
       navigate('/dashboard')
     } catch (error: any) {
-      message.error(error.response?.data?.message || 'Kirishda xatolik yuz berdi')
+      message.error(error.response?.data?.message || 'Login yoki parol noto\'g\'ri')
     }
   }
 
@@ -43,11 +40,11 @@ const Login = () => {
     <StyledContainer>
       <StyledCard>
         <Space direction="vertical" size="large" style={{ width: '100%', textAlign: 'center' }}>
-          <Title level={2} style={{ color: '#1890ff' }}>
-            🤖 Reklama Bot
+          <Title level={2} style={{ color: '#1890ff', marginBottom: 0 }}>
+            Reklama Bot
           </Title>
           <Paragraph type="secondary">
-            Telegram orqali tizimga kirish
+            Admin panelga kirish
           </Paragraph>
         </Space>
 
@@ -56,33 +53,27 @@ const Login = () => {
           onFinish={handleSubmit}
           layout="vertical"
           size="large"
+          initialValues={{ username: '', password: '' }}
         >
           <Form.Item
-            label="Telegram ID"
-            name="telegramId"
-            rules={[
-              { required: true, message: 'Telegram ID kiriting!' },
-              { pattern: /^[0-9]+$/, message: 'Faqat raqamlar!' },
-            ]}
+            label="Login"
+            name="username"
+            rules={[{ required: true, message: 'Login kiriting!' }]}
           >
             <Input
               prefix={<UserOutlined />}
-              placeholder="123456789"
-              value={telegramId}
-              onChange={(e) => setTelegramId(e.target.value)}
+              placeholder="admin"
             />
           </Form.Item>
 
           <Form.Item
-            label="Auth Data"
-            name="authData"
-            rules={[{ required: true, message: 'Auth data kiriting!' }]}
+            label="Parol"
+            name="password"
+            rules={[{ required: true, message: 'Parol kiriting!' }]}
           >
             <Input.Password
               prefix={<LockOutlined />}
-              placeholder="Telegram auth data"
-              value={authData}
-              onChange={(e) => setAuthData(e.target.value)}
+              placeholder="Parolni kiriting"
             />
           </Form.Item>
 
@@ -99,12 +90,9 @@ const Login = () => {
           </Form.Item>
         </Form>
 
-        <div style={{ textAlign: 'center', marginTop: '16px' }}>
-          <Paragraph type="secondary" style={{ fontSize: '12px' }}>
-            Telegram orqali kirish uchun botimizga: <br />
-            <a href="https://t.me/your_bot" target="_blank" rel="noopener">
-              @reklama_bot
-            </a>
+        <div style={{ textAlign: 'center', marginTop: 8, padding: '12px', background: '#f5f5f5', borderRadius: 8 }}>
+          <Paragraph type="secondary" style={{ fontSize: 12, marginBottom: 0 }}>
+            Default: <strong>admin</strong> / <strong>admin123</strong>
           </Paragraph>
         </div>
       </StyledCard>

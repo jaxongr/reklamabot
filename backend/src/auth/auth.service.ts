@@ -181,6 +181,60 @@ export class AuthService {
   }
 
   /**
+   * Admin login with username + password (for dashboard)
+   */
+  async adminLogin(username: string, password: string) {
+    // Find user by username
+    const user = await this.usersService.findByUsername(username);
+
+    if (!user) {
+      throw new UnauthorizedException('Foydalanuvchi topilmadi');
+    }
+
+    // Check if user is admin
+    if (!([UserRole.ADMIN, UserRole.SUPER_ADMIN, UserRole.DISPATCHER] as string[]).includes(user.role)) {
+      throw new UnauthorizedException('Dashboard faqat adminlar uchun');
+    }
+
+    if (!user.isActive) {
+      throw new UnauthorizedException('Akkaunt bloklangan');
+    }
+
+    // Verify password (stored in brandAdText field as hashed password for simplicity)
+    const crypto = await import('crypto');
+    const hashedPassword = crypto
+      .createHash('sha256')
+      .update(password)
+      .digest('hex');
+
+    // Check password - if no password set, check against default
+    const storedPassword = user.brandAdText;
+    if (storedPassword && storedPassword !== hashedPassword) {
+      throw new UnauthorizedException('Parol noto\'g\'ri');
+    }
+
+    // If no password stored yet (first login), accept default admin password
+    if (!storedPassword) {
+      const defaultPasswords: Record<string, string> = {
+        admin: 'admin123',
+        superadmin: 'admin123',
+      };
+      const defaultPass = defaultPasswords[username.toLowerCase()];
+      if (!defaultPass || password !== defaultPass) {
+        throw new UnauthorizedException('Parol noto\'g\'ri');
+      }
+    }
+
+    const tokens = await this.generateTokens(user);
+    await this.usersService.updateLastLogin(user.id);
+
+    return {
+      user: this.sanitizeUser(user),
+      ...tokens,
+    };
+  }
+
+  /**
    * Logout user (invalidate tokens if using Redis)
    */
   async logout(userId: string) {

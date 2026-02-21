@@ -107,6 +107,18 @@ export class UsersService {
   }
 
   /**
+   * Find user by username
+   */
+  async findByUsername(username: string): Promise<User | null> {
+    return this.prisma.user.findFirst({
+      where: { username: { equals: username, mode: 'insensitive' } },
+      include: {
+        subscription: true,
+      },
+    });
+  }
+
+  /**
    * Update user
    */
   async update(id: string, data: Prisma.UserUpdateInput): Promise<User> {

@@ -17,6 +17,7 @@ interface AuthState {
   token: string | null
   isLoading: boolean
   login: (telegramId: string, authData: string) => Promise<void>
+  adminLogin: (username: string, password: string) => Promise<void>
   logout: () => void
 }
 
@@ -31,6 +32,22 @@ export const useAuthStore = create<AuthState>()(
         set({ isLoading: true })
         try {
           const response = await api.post('/auth/login', { telegramId, authData })
+          const { user, accessToken, refreshToken } = response.data
+
+          localStorage.setItem('token', accessToken)
+          localStorage.setItem('refreshToken', refreshToken)
+
+          set({ user, token: accessToken, isLoading: false })
+        } catch (error) {
+          set({ isLoading: false })
+          throw error
+        }
+      },
+
+      adminLogin: async (username, password) => {
+        set({ isLoading: true })
+        try {
+          const response = await api.post('/auth/admin-login', { username, password })
           const { user, accessToken, refreshToken } = response.data
 
           localStorage.setItem('token', accessToken)
