@@ -289,7 +289,7 @@ export const usePaymentStatistics = () =>
 export const useCreatePayment = () => {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: async (data: { amount: number; planType: string; currency?: string }) => {
+    mutationFn: async (data: { amount: number; planType: string; currency?: string; receiptImage?: string }) => {
       const response = await api.post('/payments', data)
       return response.data
     },

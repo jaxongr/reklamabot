@@ -107,7 +107,7 @@ const Payments = () => {
   const [receiptUrl, setReceiptUrl] = useState<string | null>(null)
   const [receiptPreview, setReceiptPreview] = useState<string | null>(null)
 
-  const { data, isLoading } = usePayments()
+  const { data, isLoading } = usePayments(isAdmin ? undefined : { status: undefined })
   const { data: stats } = usePaymentStatistics()
   const { data: paymentCards } = usePaymentCards()
   const { data: plans } = useSubscriptionPlans()
@@ -179,6 +179,7 @@ const Payments = () => {
       await createPaymentMutation.mutateAsync({
         amount: plan.price,
         planType: selectedPlan,
+        receiptImage: receiptUrl || undefined,
       })
 
       message.success("To'lov so'rovi yuborildi! Admin tasdiqlashini kuting.")
