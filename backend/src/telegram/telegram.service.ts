@@ -508,6 +508,13 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
         throw new Error(`FLOOD_WAIT:${waitSeconds}`);
       }
 
+      // SLOWMODE
+      if (error.errorMessage?.includes('SLOWMODE_WAIT') || error.seconds) {
+        const waitSeconds = error.seconds || 300;
+        this.logger.warn(`SLOWMODE_WAIT ${waitSeconds}s — group: ${groupTelegramId}`);
+        throw new Error(`SLOWMODE_WAIT:${waitSeconds}`);
+      }
+
       // Yozish taqiqlangan
       if (
         error.errorMessage?.includes('CHAT_WRITE_FORBIDDEN') ||
@@ -515,6 +522,17 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
         error.errorMessage?.includes('CHANNEL_PRIVATE')
       ) {
         throw new Error(`WRITE_FORBIDDEN:${groupTelegramId}`);
+      }
+
+      // Cheklangan guruh
+      if (
+        error.errorMessage?.includes('CHAT_RESTRICTED') ||
+        error.errorMessage?.includes('CHAT_SEND_PLAIN_FORBIDDEN') ||
+        error.errorMessage?.includes('CHAT_GUEST_SEND_FORBIDDEN') ||
+        error.errorMessage?.includes('PREMIUM_ACCOUNT_REQUIRED') ||
+        error.errorMessage?.includes('CHAT_SEND_MEDIA_FORBIDDEN')
+      ) {
+        throw new Error(`CHAT_RESTRICTED:${groupTelegramId}`);
       }
 
       // Session o'lgan
