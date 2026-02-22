@@ -11,6 +11,7 @@ import {
   Query,
 } from '@nestjs/common';
 import { SessionsService } from './sessions.service';
+import { TelegramService } from '../telegram/telegram.service';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { SessionStatus } from '@prisma/client';
@@ -21,7 +22,10 @@ import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
 @Controller('sessions')
 @UseGuards(JwtAuthGuard, RolesGuard)
 export class SessionsController {
-  constructor(private readonly sessionsService: SessionsService) {}
+  constructor(
+    private readonly sessionsService: SessionsService,
+    private readonly telegramService: TelegramService,
+  ) {}
 
   @Get()
   @ApiOperation({ summary: 'Get user sessions' })
@@ -34,6 +38,15 @@ export class SessionsController {
       status,
       includeFrozen: includeFrozen === 'true' ? true : includeFrozen === 'false' ? false : undefined,
     });
+  }
+
+  @Get('connection-status')
+  @ApiOperation({ summary: 'Check all sessions connection status' })
+  async getConnectionStatus(@Request() req: any) {
+    const sessions = await this.sessionsService.findAll(req.user.userId, {});
+    const sessionData = Array.isArray(sessions) ? sessions : (sessions as any).data || [];
+    const sessionIds = sessionData.map((s: any) => s.id);
+    return this.telegramService.checkAllSessionConnections(sessionIds);
   }
 
   @Get(':id')

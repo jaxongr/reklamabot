@@ -10,17 +10,23 @@ import {
   Query,
 } from '@nestjs/common';
 import { PostsService } from './posts.service';
+import { PostingService } from './posting.service';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { PostStatus } from '@prisma/client';
 import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
+import { PrismaService } from '../common/prisma.service';
 
 @ApiTags('Posts')
 @ApiBearerAuth()
 @Controller('posts')
 @UseGuards(JwtAuthGuard, RolesGuard)
 export class PostsController {
-  constructor(private readonly postsService: PostsService) {}
+  constructor(
+    private readonly postsService: PostsService,
+    private readonly postingService: PostingService,
+    private readonly prisma: PrismaService,
+  ) {}
 
   @Post()
   @ApiOperation({ summary: 'Create post distribution' })
@@ -97,6 +103,57 @@ export class PostsController {
   async retry(@Param('id') id: string) {
     await this.postsService.retryFailed(id);
     return { message: 'Retrying failed deliveries' };
+  }
+
+  @Post('start-posting/:adId')
+  @ApiOperation({ summary: 'Start posting for ad (admin dashboard)' })
+  async startPosting(@Request() req: any, @Param('adId') adId: string) {
+    const ad = await this.prisma.ad.findUnique({ where: { id: adId } });
+    if (!ad) {
+      throw new Error("E'lon topilmadi");
+    }
+
+    const job = await this.postingService.startPosting(adId, ad.content, req.user.userId);
+    return {
+      jobId: job.id,
+      status: job.status,
+      totalGroups: job.totalGroups,
+      message: 'Tarqatish boshlandi',
+    };
+  }
+
+  @Post('stop-posting/:adId')
+  @ApiOperation({ summary: 'Stop posting for ad' })
+  async stopPosting(@Request() req: any, @Param('adId') adId: string) {
+    const jobs = this.postingService.getUserJobs(req.user.userId);
+    const job = jobs.find(j => j.adId === adId && j.status === 'running');
+    if (!job) {
+      throw new Error("Bu e'lon uchun faol tarqatish topilmadi");
+    }
+
+    this.postingService.stopJob(job.id);
+    return {
+      jobId: job.id,
+      message: "Tarqatish to'xtatildi",
+    };
+  }
+
+  @Get('posting-status/:adId')
+  @ApiOperation({ summary: 'Get posting status for ad' })
+  async getPostingStatus(@Request() req: any, @Param('adId') adId: string) {
+    const jobs = this.postingService.getUserJobs(req.user.userId);
+    const job = jobs.find(j => j.adId === adId);
+    if (!job) {
+      return { active: false, message: 'Faol tarqatish yo\'q' };
+    }
+
+    const stats = this.postingService.getJobStats(job.id);
+    return {
+      active: job.status === 'running',
+      jobId: job.id,
+      status: job.status,
+      ...stats,
+    };
   }
 
   @Delete(':id')

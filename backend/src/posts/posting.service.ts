@@ -337,11 +337,60 @@ export class PostingService {
   }
 
   /**
-   * Bitta round — barcha guruhlarga yuborish
+   * Bitta round — barcha guruhlarga PARALLEL yuborish (har session o'z guruhlarini)
    */
   private async postRound(job: PostingJob, groups: GroupInfo[]): Promise<void> {
     const roundStart = Date.now();
-    let messageCountInRound = 0;
+
+    // Guruhlarni session bo'yicha guruhlash
+    const groupsBySession = new Map<string, GroupInfo[]>();
+    for (const group of groups) {
+      const existing = groupsBySession.get(group.sessionId) || [];
+      existing.push(group);
+      groupsBySession.set(group.sessionId, existing);
+    }
+
+    this.logger.log(
+      `🔄 Round #${job.roundsCompleted + 1} boshlandi — ` +
+      `${groupsBySession.size} ta session PARALLEL, jami ${groups.length} guruh`,
+    );
+
+    // Barcha sessionlarni parallel ishga tushirish
+    const sessionTasks = Array.from(groupsBySession.entries()).map(
+      ([sessionId, sessionGroups]) =>
+        this.postSessionGroups(job, sessionId, this.shuffleArray([...sessionGroups])),
+    );
+
+    const results = await Promise.allSettled(sessionTasks);
+
+    // Natijalarni yig'ish
+    let totalPosted = 0;
+    for (const result of results) {
+      if (result.status === 'fulfilled') {
+        totalPosted += result.value;
+      } else {
+        this.logger.error(`Session task xatolik: ${result.reason}`);
+      }
+    }
+
+    const roundDuration = Math.floor((Date.now() - roundStart) / 1000);
+    job.roundsCompleted++;
+
+    this.logger.log(
+      `✅ Round #${job.roundsCompleted} — ${roundDuration}s — ` +
+      `Yuborildi: ${totalPosted}`,
+    );
+  }
+
+  /**
+   * Bitta session guruhlariga ketma-ket yuborish (anti-spam delay bilan)
+   */
+  private async postSessionGroups(
+    job: PostingJob,
+    sessionId: string,
+    groups: GroupInfo[],
+  ): Promise<number> {
+    let messageCount = 0;
 
     for (let i = 0; i < groups.length; i++) {
       if (job.stopRequested) break;
@@ -368,7 +417,7 @@ export class PostingService {
           status: 'skipped',
           reason: `Cooldown (${GROUP_COOLDOWN_MS / 60000} daqiqa o'tmagan)`,
         });
-        continue; // Delay yo'q — keyingi guruhga
+        continue;
       }
 
       // ===== 2. Session cooldown tekshirish =====
@@ -390,7 +439,7 @@ export class PostingService {
       const result = await this.postToGroup(job, group);
       if (result.success) {
         job.postedGroups++;
-        messageCountInRound++;
+        messageCount++;
         this.recordSuccess(group.sessionId);
 
         // Guruh lastPostAt yangilash
@@ -408,10 +457,10 @@ export class PostingService {
       // ===== 4. Anti-spam delaylar =====
       if (i < groups.length - 1 && !job.stopRequested) {
         // Har N xabardan keyin uzun pauza (tabiiy ko'rinish)
-        if (messageCountInRound > 0 && messageCountInRound % LONG_PAUSE_INTERVAL === 0) {
+        if (messageCount > 0 && messageCount % LONG_PAUSE_INTERVAL === 0) {
           const longPause = this.getRandomDelay(LONG_PAUSE_MIN_MS, LONG_PAUSE_MAX_MS);
           this.logger.log(
-            `⏸ ${messageCountInRound} xabar yuborildi — ` +
+            `⏸ Session ${sessionId.slice(0, 8)}... ${messageCount} xabar — ` +
             `${Math.floor(longPause / 1000)}s uzun pauza`,
           );
           await this.delay(longPause);
@@ -423,13 +472,7 @@ export class PostingService {
       }
     }
 
-    const roundDuration = Math.floor((Date.now() - roundStart) / 1000);
-    job.roundsCompleted++;
-
-    this.logger.log(
-      `✅ Round #${job.roundsCompleted} — ${roundDuration}s — ` +
-      `Yuborildi: ${messageCountInRound}`,
-    );
+    return messageCount;
   }
 
   /**

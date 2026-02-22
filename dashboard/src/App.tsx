@@ -16,6 +16,7 @@ import Posts from './pages/Posts/Posts'
 import Payments from './pages/Payments/Payments'
 import Analytics from './pages/Analytics/Analytics'
 import Settings from './pages/Settings/Settings'
+import Users from './pages/Users/Users'
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -58,6 +59,7 @@ function App() {
               <Route path="groups" element={<Groups />} />
               <Route path="posts" element={<Posts />} />
               <Route path="payments" element={<Payments />} />
+              <Route path="users" element={<Users />} />
               <Route path="analytics" element={<Analytics />} />
               <Route path="settings" element={<Settings />} />
             </Route>

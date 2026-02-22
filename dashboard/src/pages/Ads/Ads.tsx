@@ -13,6 +13,8 @@ import {
   Row,
   Col,
   Statistic,
+  Progress,
+  Tooltip,
 } from 'antd'
 import {
   PlusOutlined,
@@ -21,11 +23,14 @@ import {
   CopyOutlined,
   SendOutlined,
   StopOutlined,
+  RocketOutlined,
+  PauseCircleOutlined,
 } from '@ant-design/icons'
 import styled from 'styled-components'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import api from '../../services/api'
 import { useNavigate } from 'react-router-dom'
+import { useStartPosting, useStopPosting, usePostingStatus } from '../../hooks/useApi'
 
 const { Title } = Typography
 const { Search } = Input
@@ -49,6 +54,27 @@ const StatusTag = ({ status }: { status: string }) => {
   const { color, text } = statusMap[status] || { color: 'default', text: status }
 
   return <Tag color={color}>{text}</Tag>
+}
+
+/** Posting status badge for a single ad */
+const PostingStatusBadge = ({ adId }: { adId: string }) => {
+  const { data } = usePostingStatus(adId)
+  if (!data || !data.active) return null
+
+  const percent = data.totalGroups > 0
+    ? Math.round((data.postedGroups / data.totalGroups) * 100)
+    : 0
+
+  return (
+    <Tooltip title={`${data.postedGroups}/${data.totalGroups} guruhga yuborildi`}>
+      <Progress
+        percent={percent}
+        size="small"
+        style={{ width: 100, display: 'inline-block', marginLeft: 8 }}
+        status="active"
+      />
+    </Tooltip>
+  )
 }
 
 const Ads = () => {
@@ -102,6 +128,9 @@ const Ads = () => {
     },
   })
 
+  const startPostingMutation = useStartPosting()
+  const stopPostingMutation = useStopPosting()
+
   const handleDelete = (id: string) => {
     deleteMutation.mutate(id)
   }
@@ -118,6 +147,24 @@ const Ads = () => {
     navigate(`/ads/${id}/duplicate`)
   }
 
+  const handleStartPosting = async (adId: string) => {
+    try {
+      await startPostingMutation.mutateAsync(adId)
+      message.success('Tarqatish boshlandi!')
+    } catch (err: any) {
+      message.error(err?.response?.data?.message || 'Tarqatishni boshlashda xatolik')
+    }
+  }
+
+  const handleStopPosting = async (adId: string) => {
+    try {
+      await stopPostingMutation.mutateAsync(adId)
+      message.success("Tarqatish to'xtatildi")
+    } catch (err: any) {
+      message.error(err?.response?.data?.message || "Tarqatishni to'xtatishda xatolik")
+    }
+  }
+
   const columns = [
     {
       title: 'ID',
@@ -131,6 +178,12 @@ const Ads = () => {
       dataIndex: 'title',
       key: 'title',
       ellipsis: true,
+      render: (title: string, record: any) => (
+        <span>
+          {title}
+          {record.status === 'ACTIVE' && <PostingStatusBadge adId={record.id} />}
+        </span>
+      ),
     },
     {
       title: 'Narx',
@@ -165,10 +218,10 @@ const Ads = () => {
     {
       title: 'Amallar',
       key: 'actions',
-      width: 250,
+      width: 350,
       fixed: 'right' as const,
       render: (_: any, record: any) => (
-        <Space size="small">
+        <Space size="small" wrap>
           <Button
             type="link"
             icon={<EyeOutlined />}
@@ -192,16 +245,36 @@ const Ads = () => {
               Nashr qilish
             </Button>
           ) : record.status === 'ACTIVE' ? (
-            <Button
-              type="link"
-              icon={<StopOutlined />}
-              onClick={() => handlePause(record.id)}
-            >
-              To'xtatish
-            </Button>
+            <>
+              <Button
+                type="link"
+                icon={<StopOutlined />}
+                onClick={() => handlePause(record.id)}
+              >
+                To'xtatish
+              </Button>
+              <Button
+                type="primary"
+                size="small"
+                icon={<RocketOutlined />}
+                onClick={() => handleStartPosting(record.id)}
+                loading={startPostingMutation.isPending}
+              >
+                Tarqatish
+              </Button>
+              <Button
+                danger
+                size="small"
+                icon={<PauseCircleOutlined />}
+                onClick={() => handleStopPosting(record.id)}
+                loading={stopPostingMutation.isPending}
+              >
+                To'xtatish
+              </Button>
+            </>
           ) : null}
           <Popconfirm
-            title="E\'lonni o\'chirishni tasdiqlaysizmi?"
+            title="E'lonni o'chirishni tasdiqlaysizmi?"
             onConfirm={() => handleDelete(record.id)}
             okText="Ha"
             cancelText="Yo'q"
@@ -227,7 +300,7 @@ const Ads = () => {
               marginBottom: 24,
             }}
           >
-            <Title level={2}>📣 E\'lonlar</Title>
+            <Title level={2}>E'lonlar</Title>
             <Button
               type="primary"
               icon={<PlusOutlined />}
@@ -242,9 +315,8 @@ const Ads = () => {
         <Col xs={24} sm={12} md={6}>
           <StyledCard>
             <Statistic
-              title="Jami E\'lonlar"
+              title="Jami E'lonlar"
               value={data?.meta?.total || 0}
-              prefix="📣"
             />
           </StyledCard>
         </Col>
@@ -252,9 +324,8 @@ const Ads = () => {
         <Col xs={24} sm={12} md={6}>
           <StyledCard>
             <Statistic
-              title="Faol E\'lonlar"
+              title="Faol E'lonlar"
               value={data?.data?.filter((a: any) => a.status === 'ACTIVE').length || 0}
-              prefix="✅"
               valueStyle={{ color: '#52c41a' }}
             />
           </StyledCard>
@@ -265,7 +336,6 @@ const Ads = () => {
             <Statistic
               title="Qoralamalar"
               value={data?.data?.filter((a: any) => a.status === 'DRAFT').length || 0}
-              prefix="📝"
             />
           </StyledCard>
         </Col>
@@ -275,7 +345,6 @@ const Ads = () => {
             <Statistic
               title="Yopilgan"
               value={data?.data?.filter((a: any) => a.status === 'CLOSED').length || 0}
-              prefix="🔒"
               valueStyle={{ color: '#ff4d4f' }}
             />
           </StyledCard>

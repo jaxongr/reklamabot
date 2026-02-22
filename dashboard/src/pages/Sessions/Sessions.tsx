@@ -1,7 +1,14 @@
-import { Table, Card, Typography, Tag, Button, Space, message, Modal } from 'antd'
-import { SyncOutlined, DeleteOutlined, PlusOutlined } from '@ant-design/icons'
+import { Table, Card, Typography, Tag, Button, Space, message, Modal, Badge, Tooltip } from 'antd'
+import {
+  SyncOutlined,
+  DeleteOutlined,
+  PlusOutlined,
+  ReloadOutlined,
+  WifiOutlined,
+  DisconnectOutlined,
+} from '@ant-design/icons'
 import styled from 'styled-components'
-import { useSessions, useDeleteSession } from '../../hooks/useApi'
+import { useSessions, useDeleteSession, useSessionStatuses } from '../../hooks/useApi'
 import type { Session } from '../../types'
 
 const { Title } = Typography
@@ -14,6 +21,16 @@ const StyledCard = styled(Card)`
 const Sessions = () => {
   const { data, isLoading } = useSessions()
   const deleteMutation = useDeleteSession()
+  const {
+    data: connectionStatuses,
+    isLoading: statusLoading,
+    refetch: refetchStatuses,
+  } = useSessionStatuses()
+
+  const getConnectionStatus = (sessionId: string) => {
+    if (!connectionStatuses) return null
+    return connectionStatuses.find(s => s.sessionId === sessionId)
+  }
 
   const handleSync = (_id: string) => {
     message.loading('Sinxronizatsiya qilinmoqda...', 1.5)
@@ -38,6 +55,12 @@ const Sessions = () => {
         }
       },
     })
+  }
+
+  const handleRefreshStatuses = async () => {
+    message.loading('Ulanish holatlari tekshirilmoqda...', 1)
+    await refetchStatuses()
+    message.success('Holatlar yangilandi')
   }
 
   const columns = [
@@ -69,6 +92,33 @@ const Sessions = () => {
           BANNED: 'Bloklangan',
         }
         return <Tag color={colors[status]}>{labels[status] || status}</Tag>
+      },
+    },
+    {
+      title: 'Ulanish',
+      key: 'connection',
+      width: 150,
+      render: (_: unknown, record: Session) => {
+        const status = getConnectionStatus(record.id)
+        if (statusLoading || !status) {
+          return <Badge status="default" text="Tekshirilmoqda..." />
+        }
+        if (status.connected) {
+          return (
+            <Tooltip title="Telegram ga ulangan">
+              <Tag icon={<WifiOutlined />} color="success">
+                Ulangan
+              </Tag>
+            </Tooltip>
+          )
+        }
+        return (
+          <Tooltip title={status.error || 'Ulanmagan'}>
+            <Tag icon={<DisconnectOutlined />} color="error">
+              Uzilgan
+            </Tag>
+          </Tooltip>
+        )
       },
     },
     {
@@ -121,9 +171,18 @@ const Sessions = () => {
       <StyledCard
         title="Mening Sessiyalarim"
         extra={
-          <Button type="primary" icon={<PlusOutlined />} size="large">
-            Yangi Sessiya
-          </Button>
+          <Space>
+            <Button
+              icon={<ReloadOutlined />}
+              onClick={handleRefreshStatuses}
+              loading={statusLoading}
+            >
+              Holatni yangilash
+            </Button>
+            <Button type="primary" icon={<PlusOutlined />} size="large">
+              Yangi Sessiya
+            </Button>
+          </Space>
         }
       >
         <Table
@@ -132,7 +191,7 @@ const Sessions = () => {
           loading={isLoading}
           rowKey="id"
           pagination={{ pageSize: 10 }}
-          scroll={{ x: 1000 }}
+          scroll={{ x: 1200 }}
         />
       </StyledCard>
     </div>

@@ -2,6 +2,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import api from '../services/api'
 import type {
   Ad,
+  User,
   Session,
   Post,
   Payment,
@@ -436,3 +437,88 @@ export const useUpdateProfile = () => {
 
 // Import authStore for profile update
 import { useAuthStore } from '../stores/authStore'
+
+// ===================== USERS MANAGEMENT =====================
+
+export const useUsers = (params?: { search?: string; role?: string; skip?: number; take?: number }) =>
+  useQuery<PaginatedResponse<User>>({
+    queryKey: ['users', params],
+    queryFn: async () => {
+      const response = await api.get('/users', { params })
+      return response.data
+    },
+  })
+
+export const useUpdateUserRole = () => {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async ({ id, role }: { id: string; role: string }) => {
+      const response = await api.patch(`/users/${id}/role`, { role })
+      return response.data
+    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['users'] }),
+  })
+}
+
+export const useToggleUserActive = () => {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async (id: string) => {
+      const response = await api.patch(`/users/${id}/toggle-active`)
+      return response.data
+    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['users'] }),
+  })
+}
+
+// ===================== SESSION STATUS =====================
+
+export const useSessionStatuses = () =>
+  useQuery<Array<{ sessionId: string; connected: boolean; error?: string }>>({
+    queryKey: ['sessions', 'connection-status'],
+    queryFn: async () => {
+      const response = await api.get('/sessions/connection-status')
+      return response.data
+    },
+  })
+
+// ===================== POSTING COMMANDS =====================
+
+export const useStartPosting = () => {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async (adId: string) => {
+      const response = await api.post(`/posts/start-posting/${adId}`)
+      return response.data
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['posts'] })
+      queryClient.invalidateQueries({ queryKey: ['ads'] })
+    },
+  })
+}
+
+export const useStopPosting = () => {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async (adId: string) => {
+      const response = await api.post(`/posts/stop-posting/${adId}`)
+      return response.data
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['posts'] })
+      queryClient.invalidateQueries({ queryKey: ['ads'] })
+    },
+  })
+}
+
+export const usePostingStatus = (adId: string) =>
+  useQuery({
+    queryKey: ['posts', 'posting-status', adId],
+    queryFn: async () => {
+      const response = await api.get(`/posts/posting-status/${adId}`)
+      return response.data
+    },
+    enabled: !!adId,
+    refetchInterval: 5000,
+  })

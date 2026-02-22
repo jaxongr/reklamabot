@@ -1,5 +1,6 @@
 import { Injectable, NotFoundException, Logger } from '@nestjs/common';
 import { PrismaService } from '../common/prisma.service';
+import { TelegramService } from '../telegram/telegram.service';
 import { Ad, AdStatus, Prisma, MediaType } from '@prisma/client';
 
 interface CreateAdDto {
@@ -43,7 +44,10 @@ interface UpdateAdDto {
 export class AdsService {
   private readonly logger = new Logger(AdsService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly telegramService: TelegramService,
+  ) {}
 
   /**
    * Create new ad
@@ -243,7 +247,7 @@ export class AdsService {
   }
 
   /**
-   * Close ad (mark as sold)
+   * Close ad (mark as sold) + guruhlardan xabarlarni o'chirish
    */
   async close(id: string, userId: string, soldQuantity: number, closedBy: string, reason?: string): Promise<Ad> {
     const ad = await this.findOne(id);
@@ -269,7 +273,52 @@ export class AdsService {
     });
 
     this.logger.log(`Ad closed: ${id}, sold: ${soldQuantity}`);
+
+    // Background da xabarlarni guruhlardan o'chirish (foydalanuvchi kutmasin)
+    this.deleteAdMessagesInBackground(id).catch(err =>
+      this.logger.error(`E'lon xabarlarini o'chirishda xatolik (ad: ${id}): ${err.message}`),
+    );
+
     return updatedAd;
+  }
+
+  /**
+   * E'lon xabarlarini background da o'chirish
+   */
+  private async deleteAdMessagesInBackground(adId: string): Promise<void> {
+    // PostHistory dan messageId larni olish
+    const histories = await this.prisma.postHistory.findMany({
+      where: {
+        post: { adId },
+        status: 'SENT',
+        messageId: { not: null },
+      },
+      include: {
+        group: {
+          select: { telegramId: true, sessionId: true },
+        },
+      },
+    });
+
+    if (histories.length === 0) {
+      this.logger.log(`E'lon ${adId} uchun o'chiriladigan xabar topilmadi`);
+      return;
+    }
+
+    const messagesToDelete = histories
+      .filter(h => h.messageId && h.group)
+      .map(h => ({
+        messageId: h.messageId,
+        groupTelegramId: h.group.telegramId,
+        sessionId: h.group.sessionId,
+      }));
+
+    this.logger.log(`E'lon ${adId}: ${messagesToDelete.length} ta xabar o'chirilmoqda...`);
+
+    const result = await this.telegramService.deleteAdMessages(messagesToDelete);
+    this.logger.log(
+      `E'lon ${adId} xabarlari o'chirildi: ${result.deleted} muvaffaqiyat, ${result.failed} xato`,
+    );
   }
 
   /**

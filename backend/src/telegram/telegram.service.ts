@@ -550,6 +550,87 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
+   * Bitta xabarni o'chirish
+   */
+  async deleteMessage(
+    sessionId: string,
+    chatId: string,
+    messageId: number,
+  ): Promise<boolean> {
+    const client = this.clients.get(sessionId);
+    if (!client || !client.connected) {
+      this.logger.warn(`Session ${sessionId} ulangan emas — xabar o'chirilmadi`);
+      return false;
+    }
+
+    try {
+      await client.invoke(
+        new Api.messages.DeleteMessages({
+          id: [messageId],
+          revoke: true,
+        }),
+      );
+      return true;
+    } catch (error: any) {
+      // Channel/Supergroup uchun boshqa API
+      try {
+        const peer = await client.getInputEntity(chatId);
+        await client.invoke(
+          new Api.channels.DeleteMessages({
+            channel: peer as any,
+            id: [messageId],
+          }),
+        );
+        return true;
+      } catch (innerError: any) {
+        this.logger.warn(
+          `Xabar o'chirishda xatolik (session: ${sessionId.slice(0, 8)}..., ` +
+          `chat: ${chatId}, msg: ${messageId}): ${innerError.message}`,
+        );
+        return false;
+      }
+    }
+  }
+
+  /**
+   * E'lon xabarlarini guruhlardan o'chirish (PostHistory[] dan)
+   */
+  async deleteAdMessages(
+    postHistories: Array<{
+      messageId: number | null;
+      groupTelegramId: string;
+      sessionId: string;
+    }>,
+  ): Promise<{ deleted: number; failed: number }> {
+    let deleted = 0;
+    let failed = 0;
+
+    // Session bo'yicha guruhlash — parallel o'chirish
+    const bySession = new Map<string, Array<{ messageId: number; chatId: string }>>();
+    for (const h of postHistories) {
+      if (!h.messageId) continue;
+      const existing = bySession.get(h.sessionId) || [];
+      existing.push({ messageId: h.messageId, chatId: h.groupTelegramId });
+      bySession.set(h.sessionId, existing);
+    }
+
+    const tasks = Array.from(bySession.entries()).map(async ([sessionId, messages]) => {
+      for (const msg of messages) {
+        const success = await this.deleteMessage(sessionId, msg.chatId, msg.messageId);
+        if (success) deleted++;
+        else failed++;
+        // Anti-spam: kichik delay
+        await new Promise(r => setTimeout(r, 200));
+      }
+    });
+
+    await Promise.allSettled(tasks);
+
+    this.logger.log(`E'lon xabarlari o'chirildi: ${deleted} muvaffaqiyat, ${failed} xato`);
+    return { deleted, failed };
+  }
+
+  /**
    * Foydalanuvchining ulangan sessionlari
    */
   async getUserSessions(userId: string) {
@@ -582,6 +663,55 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       if (client.connected) count++;
     }
     return count;
+  }
+
+  /**
+   * Session ulanish holatini tekshirish
+   */
+  async checkSessionConnection(sessionId: string): Promise<{
+    connected: boolean;
+    error?: string;
+  }> {
+    const client = this.clients.get(sessionId);
+    if (!client) {
+      return { connected: false, error: 'Client topilmadi' };
+    }
+
+    if (!client.connected) {
+      return { connected: false, error: 'Aloqa uzilgan' };
+    }
+
+    try {
+      await client.getMe();
+      return { connected: true };
+    } catch (error: any) {
+      return { connected: false, error: error.message };
+    }
+  }
+
+  /**
+   * Barcha sessionlarning ulanish holatini tekshirish
+   */
+  async checkAllSessionConnections(sessionIds: string[]): Promise<
+    Array<{ sessionId: string; connected: boolean; error?: string }>
+  > {
+    const results = await Promise.allSettled(
+      sessionIds.map(async (sessionId) => {
+        const status = await this.checkSessionConnection(sessionId);
+        return { sessionId, ...status };
+      }),
+    );
+
+    return results.map((result, index) => {
+      if (result.status === 'fulfilled') {
+        return result.value;
+      }
+      return {
+        sessionId: sessionIds[index],
+        connected: false,
+        error: result.reason?.message || 'Tekshirishda xatolik',
+      };
+    });
   }
 
   /**
