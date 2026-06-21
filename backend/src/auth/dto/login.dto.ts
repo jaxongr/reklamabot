@@ -1,5 +1,5 @@
-import { IsString, IsNotEmpty } from 'class-validator';
-import { ApiProperty } from '@nestjs/swagger';
+import { IsString, IsNotEmpty, IsOptional } from 'class-validator';
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
 export class LoginDto {
   @ApiProperty({ example: '123456789' })
@@ -11,4 +11,9 @@ export class LoginDto {
   @IsString()
   @IsNotEmpty()
   authData: string;
+
+  @ApiPropertyOptional({ example: 'DRIVER', description: 'User role (DRIVER for driver app)' })
+  @IsString()
+  @IsOptional()
+  role?: string;
 }

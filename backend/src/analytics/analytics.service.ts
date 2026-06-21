@@ -299,4 +299,119 @@ export class AnalyticsService {
 
     return { gte: prevStart, lte: prevEnd };
   }
+
+  /**
+   * Foydalanuvchi faollik statistikasi — kunlik
+   * - Har kuni nechta unikal foydalanuvchi online bo'lgan
+   * - O'rtacha sessiya davomiyligi
+   * - Dispetcher vs Haydovchi taqsimoti
+   */
+  async getUserActivityStats(days: number = 30) {
+    const cacheKey = `analytics:user-activity:${days}`;
+    const cached = await this.redis.get(cacheKey);
+    if (cached) return cached;
+
+    const startDate = new Date();
+    startDate.setDate(startDate.getDate() - days);
+    startDate.setHours(0, 0, 0, 0);
+
+    // 1. Kunlik buyurtmalar soni
+    const dailyOrders = await this.prisma.$queryRaw<
+      Array<{ day: Date; order_count: bigint; cargo_count: bigint; driver_count: bigint }>
+    >`
+      SELECT
+        DATE("createdAt") as day,
+        COUNT(*)::bigint as order_count,
+        COUNT(*) FILTER (WHERE "type" = 'CARGO')::bigint as cargo_count,
+        COUNT(*) FILTER (WHERE "type" = 'DRIVER')::bigint as driver_count
+      FROM "Order"
+      WHERE "createdAt" >= ${startDate}
+      GROUP BY DATE("createdAt")
+      ORDER BY day ASC
+    `;
+
+    // 2. Kunlik ilovaga kirgan foydalanuvchilar — lastOnlineAt asosida (eng ishonchli)
+    const dailyOnline = await this.prisma.$queryRaw<
+      Array<{ day: Date; total_users: bigint; dispatchers: bigint; drivers: bigint; admins: bigint }>
+    >`
+      SELECT
+        DATE("lastOnlineAt") as day,
+        COUNT(DISTINCT id)::bigint as total_users,
+        COUNT(DISTINCT id) FILTER (WHERE role = 'DISPATCHER')::bigint as dispatchers,
+        COUNT(DISTINCT id) FILTER (WHERE role = 'DRIVER')::bigint as drivers,
+        COUNT(DISTINCT id) FILTER (WHERE role IN ('ADMIN', 'SUPER_ADMIN'))::bigint as admins
+      FROM "User"
+      WHERE "lastOnlineAt" >= ${startDate} AND "lastOnlineAt" IS NOT NULL
+      GROUP BY DATE("lastOnlineAt")
+      ORDER BY day ASC
+    `;
+
+    // 3. Hozir online
+    const nowOnline = await this.prisma.user.count({ where: { isOnline: true } });
+    const nowDispatchers = await this.prisma.user.count({ where: { isOnline: true, role: 'DISPATCHER' } });
+    const nowDrivers = await this.prisma.user.count({ where: { isOnline: true, role: 'DRIVER' } });
+
+    // 4. Redis'dan bugungi faollik vaqti (daqiqalar)
+    const today = new Date().toISOString().split('T')[0];
+    const allUsers = await this.prisma.user.findMany({
+      where: { role: { in: ['DISPATCHER', 'DRIVER'] } },
+      select: { id: true, role: true },
+    });
+    let totalMinutes = 0;
+    let activeUsersToday = 0;
+    for (const u of allUsers) {
+      const mins = parseInt(await this.redis.get(`user:activity:${u.id}:${today}`) || '0');
+      if (mins > 0) {
+        totalMinutes += mins;
+        activeUsersToday++;
+      }
+    }
+    const avgMinutesToday = activeUsersToday > 0 ? Math.round(totalMinutes / activeUsersToday) : 0;
+
+    // 5. Umumiy statistika
+    const totalRegistered = await this.prisma.user.count({ where: { role: { in: ['DISPATCHER', 'DRIVER'] } } });
+    const totalActiveWeek = await this.prisma.user.count({
+      where: { lastOnlineAt: { gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) }, role: { in: ['DISPATCHER', 'DRIVER'] } },
+    });
+
+    // Merge daily data — online asosiy, orderlar qo'shimcha
+    const orderMap = new Map<string, { orderCount: number; cargoCount: number; driverCount: number }>();
+    for (const row of dailyOrders) {
+      const key = new Date(row.day).toISOString().split('T')[0];
+      orderMap.set(key, {
+        orderCount: Number(row.order_count),
+        cargoCount: Number(row.cargo_count),
+        driverCount: Number(row.driver_count),
+      });
+    }
+
+    const dailyData = dailyOnline.map(row => {
+      const key = new Date(row.day).toISOString().split('T')[0];
+      const orders = orderMap.get(key) || { orderCount: 0, cargoCount: 0, driverCount: 0 };
+      return {
+        date: key,
+        onlineUsers: Number(row.total_users),
+        dispatchers: Number(row.dispatchers),
+        drivers: Number(row.drivers),
+        admins: Number(row.admins),
+        ...orders,
+      };
+    });
+
+    const result = {
+      summary: {
+        nowOnline,
+        nowDispatchers,
+        nowDrivers,
+        totalRegistered,
+        totalActiveWeek,
+        activeUsersToday,
+        avgMinutesToday,
+      },
+      daily: dailyData,
+    };
+
+    await this.redis.set(cacheKey, result, 300); // 5 min cache
+    return result;
+  }
 }

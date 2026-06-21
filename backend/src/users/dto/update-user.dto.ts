@@ -47,4 +47,9 @@ export class UpdateUserDto {
   @IsBoolean()
   @IsOptional()
   brandAdEnabled?: boolean;
+
+  @ApiPropertyOptional()
+  @IsString()
+  @IsOptional()
+  gender?: string;
 }

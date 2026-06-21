@@ -1,0 +1,32 @@
+name: yolda_dispatcher
+description: "Yo'lda Dispatcher — call-center operator ilovasi"
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.5.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  flutter_riverpod: ^2.5.1
+  dio: ^5.7.0
+  go_router: ^14.6.0
+  shared_preferences: ^2.3.3
+  google_fonts: ^6.2.1
+  geolocator: ^13.0.1
+  permission_handler: ^11.3.1
+  socket_io_client: ^3.0.1
+  device_info_plus: ^11.1.1
+  package_info_plus: ^8.1.0
+  url_launcher: ^6.3.1
+  intl: ^0.19.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true

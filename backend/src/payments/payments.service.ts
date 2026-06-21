@@ -1,4 +1,5 @@
 import { Injectable, NotFoundException, BadRequestException, Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../common/prisma.service';
 import { PaymentStatus, SubscriptionPlan, Prisma } from '@prisma/client';
 import { SubscriptionsService } from '../subscriptions/subscriptions.service';
@@ -6,11 +7,17 @@ import { SubscriptionsService } from '../subscriptions/subscriptions.service';
 @Injectable()
 export class PaymentsService {
   private readonly logger = new Logger(PaymentsService.name);
+  private readonly adminChatId: string;
+  private readonly botToken: string;
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly subscriptionsService: SubscriptionsService,
-  ) {}
+    private readonly config: ConfigService,
+  ) {
+    this.adminChatId = this.config.get('ADMIN_PAYMENT_CHAT_ID') || '5475915736';
+    this.botToken = this.config.get('TELEGRAM_BOT_TOKEN') || '';
+  }
 
   async create(userId: string, amount: number, planType: SubscriptionPlan, extra?: {
     currency?: string;
@@ -32,7 +39,86 @@ export class PaymentsService {
     });
 
     this.logger.log(`Payment created: ${payment.id} for user ${userId}`);
+
+    // Telegram ga chek yuborish (admin chatga)
+    this.sendPaymentNotification(payment, userId).catch(e =>
+      this.logger.warn(`Telegram notification failed: ${e.message}`),
+    );
+
     return payment;
+  }
+
+  private async sendPaymentNotification(payment: any, userId: string) {
+    this.logger.log(`Sending payment notification: botToken=${this.botToken ? 'YES' : 'NO'}, chatId=${this.adminChatId}`);
+    if (!this.botToken || !this.adminChatId) {
+      this.logger.warn('Bot token or admin chat ID missing, skipping notification');
+      return;
+    }
+
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    const name = [user?.firstName, user?.lastName].filter(Boolean).join(' ') || 'Noma\'lum';
+    const username = user?.username ? `@${user.username}` : '';
+
+    const planLabels: Record<string, string> = {
+      STARTER: 'Starter (50,000)',
+      BUSINESS: 'Business (150,000)',
+      PREMIUM: 'Premium (300,000)',
+      ENTERPRISE: 'Enterprise (500,000)',
+    };
+
+    const text = [
+      `💰 *Yangi to'lov so'rovi*`,
+      ``,
+      `👤 *Foydalanuvchi:* ${name} ${username}`,
+      `📋 *Tarif:* ${planLabels[payment.planType] || payment.planType}`,
+      `💵 *Summa:* ${payment.amount?.toLocaleString()} UZS`,
+      `🆔 *Payment ID:* \`${payment.id}\``,
+      ``,
+      `📅 ${new Date().toLocaleString('uz-UZ', { timeZone: 'Asia/Tashkent' })}`,
+    ].join('\n');
+
+    const botUrl = `https://api.telegram.org/bot${this.botToken}`;
+    const replyMarkup = JSON.stringify({
+      inline_keyboard: [[
+        { text: '✅ Tasdiqlash', callback_data: `pay_approve_${payment.id}` },
+        { text: '❌ Rad etish', callback_data: `pay_reject_${payment.id}` },
+      ]],
+    });
+
+    const { execSync } = require('child_process');
+
+    // Chek rasmi bilan yuborish (curl + multipart)
+    if (payment.receiptImage) {
+      const filePath = require('path').join(process.cwd(), payment.receiptImage);
+      const fs = require('fs');
+      if (fs.existsSync(filePath)) {
+        try {
+          const cmd = `curl -s -X POST "${botUrl}/sendPhoto" ` +
+            `-F "chat_id=${this.adminChatId}" ` +
+            `-F "photo=@${filePath}" ` +
+            `-F "caption=${text.replace(/"/g, '\\"')}" ` +
+            `-F "parse_mode=Markdown" ` +
+            `-F 'reply_markup=${replyMarkup}'`;
+          const result = execSync(cmd, { timeout: 15000 }).toString();
+          this.logger.log(`Payment photo sent: ${JSON.parse(result).ok ? 'OK' : 'FAIL'}`);
+          return;
+        } catch (e) {
+          this.logger.warn(`curl sendPhoto failed: ${(e as any).message}`);
+        }
+      } else {
+        this.logger.warn(`Receipt file not found: ${filePath}`);
+      }
+    }
+
+    // Rasmsiz — faqat matn
+    try {
+      const cmd = `curl -s -X POST "${botUrl}/sendMessage" ` +
+        `-d "chat_id=${this.adminChatId}" ` +
+        `-d "text=${encodeURIComponent(text)}" ` +
+        `-d "parse_mode=Markdown" ` +
+        `-d 'reply_markup=${replyMarkup}'`;
+      execSync(cmd, { timeout: 15000 });
+    } catch {}
   }
 
   async findAll(params?: {
@@ -113,10 +199,34 @@ export class PaymentsService {
 
     // Activate subscription
     if (payment.planType) {
-      await this.subscriptionsService.create(payment.userId, payment.planType);
+      try {
+        await this.subscriptionsService.create(payment.userId, payment.planType);
+      } catch (e) {
+        this.logger.warn(`Subscription create failed: ${(e as any).message}`);
+      }
     }
 
-    this.logger.log(`Payment ${id} approved by admin ${adminId}`);
+    // Balans to'ldirish
+    try {
+      await this.prisma.balanceTransaction.create({
+        data: {
+          userId: payment.userId,
+          amount: payment.amount,
+          type: 'TOP_UP',
+          description: `To'lov tasdiqlandi: ${payment.amount} UZS (${payment.planType || 'Balans'})`,
+          referenceId: payment.id,
+        },
+      });
+      // Haydovchi profil balansini yangilash
+      await this.prisma.driverProfile.updateMany({
+        where: { userId: payment.userId },
+        data: { balance: { increment: payment.amount } },
+      });
+    } catch (e) {
+      this.logger.warn(`Balance topup failed: ${(e as any).message}`);
+    }
+
+    this.logger.log(`Payment ${id} approved by admin ${adminId}, amount: ${payment.amount}`);
     return updated;
   }
 

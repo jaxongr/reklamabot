@@ -18,23 +18,27 @@ import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../auth/decorators/roles.decorator';
 import { UserRole, AdStatus, MediaType } from '@prisma/client';
 import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
+import { AppGateway } from '../gateway/app.gateway';
 
 @ApiTags('Ads')
 @ApiBearerAuth()
 @Controller('ads')
 @UseGuards(JwtAuthGuard, RolesGuard)
 export class AdsController {
-  constructor(private readonly adsService: AdsService) {}
+  constructor(
+    private readonly adsService: AdsService,
+    private readonly gateway: AppGateway,
+  ) {}
 
   @Post()
   @ApiOperation({ summary: 'Create new ad' })
   async create(@Request() req: any, @Body() body: {
-    title: string;
+    title?: string;
     description?: string;
-    content: string;
-    mediaUrls: string[];
-    mediaType: MediaType;
-    price?: number;
+    content?: string;
+    mediaUrls?: string[];
+    mediaType?: MediaType;
+    price?: number | string;
     currency?: string;
     totalQuantity?: number;
     brandAdEnabled?: boolean;
@@ -44,8 +48,16 @@ export class AdsController {
     intervalMax?: number;
     groupInterval?: number;
     isPriority?: boolean;
+    cargoFrom?: string;
+    cargoTo?: string;
+    cargoWeight?: string;
+    vehicleType?: string;
+    status?: string;
   }) {
-    return this.adsService.create(req.user.userId, body);
+    const ad = await this.adsService.create(req.user.userId, body);
+    // Haydovchilarga yangi dispetcher e'loni haqida xabar
+    this.gateway?.server?.to('device:driver')?.emit('dispatcherAd:new', {});
+    return ad;
   }
 
   @Get()
@@ -71,6 +83,39 @@ export class AdsController {
   @ApiOperation({ summary: 'Get dashboard stats' })
   async getDashboardStats(@Request() req: any) {
     return this.adsService.getDashboardStats(req.user.userId);
+  }
+
+  @Get('closed/list')
+  @ApiOperation({ summary: 'Yopilgan yuklar ro\'yxati' })
+  async getClosedAds(
+    @Request() req: any,
+    @Query('skip', new DefaultValuePipe(0), ParseIntPipe) skip: number,
+    @Query('take', new DefaultValuePipe(50), ParseIntPipe) take: number,
+    @Query('search') search?: string,
+    @Query('cargoType') cargoType?: string,
+    @Query('startDate') startDate?: string,
+    @Query('endDate') endDate?: string,
+  ) {
+    return this.adsService.findClosed({ skip, take, search, cargoType, startDate, endDate });
+  }
+
+  @Post('closed/manual')
+  @ApiOperation({ summary: 'Qo\'lda yopilgan yuk kiritish' })
+  async createManualClosed(
+    @Request() req: any,
+    @Body() body: {
+      content?: string;
+      closedAmount?: number;
+      cargoFrom?: string;
+      cargoTo?: string;
+      cargoType?: string;
+      cargoWeight?: number;
+      vehicleType?: string;
+      distance?: number;
+      soldAt?: string;
+    },
+  ) {
+    return this.adsService.createManualClosed(req.user.userId, body);
   }
 
   @Get(':id')
@@ -135,15 +180,19 @@ export class AdsController {
   async close(
     @Param('id') id: string,
     @Request() req: any,
-    @Body() body: { soldQuantity: number; reason?: string },
+    @Body() body: {
+      soldQuantity: number;
+      reason?: string;
+      closedAmount?: number;
+      cargoFrom?: string;
+      cargoTo?: string;
+      cargoType?: string;
+      cargoWeight?: number;
+      vehicleType?: string;
+      distance?: number;
+    },
   ) {
-    return this.adsService.close(
-      id,
-      req.user.userId,
-      body.soldQuantity,
-      req.user.userId,
-      body.reason,
-    );
+    return this.adsService.close(id, req.user.userId, body);
   }
 
   @Post(':id/duplicate')

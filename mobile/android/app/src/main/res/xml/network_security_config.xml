@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- Default: HTTPS + cleartext (HTTP) allowed for our domain -->
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </base-config>
+
+    <!-- Our backend domain: trust all certs + allow HTTP fallback -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">logistikapro.uz</domain>
+        <domain includeSubdomains="true">185.207.251.184</domain>
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </domain-config>
+</network-security-config>

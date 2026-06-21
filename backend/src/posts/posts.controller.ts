@@ -113,7 +113,20 @@ export class PostsController {
       throw new Error("E'lon topilmadi");
     }
 
-    const job = await this.postingService.startPosting(adId, ad.content, req.user.userId);
+    // Foydalanuvchi raqamini olish va e'londagi raqamlarni almashtirish
+    const user = await this.prisma.user.findUnique({
+      where: { id: req.user.userId },
+      select: { adPhoneNumbers: true },
+    });
+
+    let content = ad.content;
+    if (user?.adPhoneNumbers && user.adPhoneNumbers.length > 0) {
+      const replacementPhone = user.adPhoneNumbers[0];
+      const phoneRegex = /(\+?\d{3}[\s\-]?\d{2}[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2})/g;
+      content = content.replace(phoneRegex, replacementPhone);
+    }
+
+    const job = await this.postingService.startPosting(adId, content, req.user.userId);
     return {
       jobId: job.id,
       status: job.status,

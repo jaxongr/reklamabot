@@ -1,3 +1,24 @@
+// Toshkent vaqti — barcha new Date() va toLocaleString() shu timezone da ishlaydi
+process.env.TZ = 'Asia/Tashkent';
+
+// gramJS TIMEOUT xatoliklari uncaught rejection sifatida chiqishi mumkin — process crash oldini olish
+process.on('unhandledRejection', (reason: any) => {
+  const msg = reason?.message || String(reason);
+  // gramJS TIMEOUT va "Not connected" — normal reconnect flow, ignore
+  if (msg === 'TIMEOUT' || msg === 'Not connected' || msg.includes('CONNECTION_NOT_INITED')) {
+    return;
+  }
+  console.error('Unhandled Rejection:', reason);
+});
+
+process.on('uncaughtException', (error: Error) => {
+  const msg = error?.message || '';
+  if (msg === 'TIMEOUT' || msg === 'Not connected') {
+    return;
+  }
+  console.error('Uncaught Exception:', error);
+});
+
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe } from '@nestjs/common';
 import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
@@ -9,10 +30,15 @@ async function bootstrap() {
   const app = await NestFactory.create<NestExpressApplication>(AppModule);
 
   // Global prefix
-  app.setGlobalPrefix('api/v1');
+  app.setGlobalPrefix('api/v1', {
+    exclude: ['/privacy.html', '/terms.html', 'privacy.html', 'terms.html'],
+  });
 
   // Static assets — chek rasmlari uchun
   app.useStaticAssets(join(process.cwd(), 'uploads'), { prefix: '/uploads' });
+
+  // Public sahifalar (privacy policy, terms)
+  app.useStaticAssets(join(process.cwd(), 'public'));
 
   // CORS
   app.enableCors({

@@ -1,8 +1,8 @@
-import { useState } from 'react'
-import { Table, Card, Typography, Tag, Button, Select, Space } from 'antd'
-import { CheckCircleOutlined, CloseCircleOutlined, ReloadOutlined } from '@ant-design/icons'
+import { useState, useMemo } from 'react'
+import { Table, Card, Typography, Tag, Button, Select, Space, Switch, message, Badge, Tabs } from 'antd'
+import { CheckCircleOutlined, CloseCircleOutlined, ReloadOutlined, StopOutlined } from '@ant-design/icons'
 import styled from 'styled-components'
-import { useSessions, useGroups } from '../../hooks/useApi'
+import { useSessions, useGroups, useBlacklistedGroups, useAddToBlacklist, useRemoveFromBlacklist } from '../../hooks/useApi'
 import type { Group } from '../../types'
 
 const { Title } = Typography
@@ -14,8 +14,12 @@ const StyledCard = styled(Card)`
 
 const Groups = () => {
   const [selectedSession, setSelectedSession] = useState<string>('')
+  const [activeTab, setActiveTab] = useState<string>('all')
   const { data: sessionsData } = useSessions()
   const { data: groupsData, isLoading, refetch } = useGroups(selectedSession)
+  const { data: blacklistedGroups = [], isLoading: blacklistLoading } = useBlacklistedGroups()
+  const addToBlacklist = useAddToBlacklist()
+  const removeFromBlacklist = useRemoveFromBlacklist()
 
   // Auto-select first session
   const sessions = sessionsData?.data || []
@@ -23,15 +27,57 @@ const Groups = () => {
     setSelectedSession(sessions[0].id)
   }
 
+  // Blacklisted group IDs set
+  const blacklistedIds = useMemo(
+    () => new Set(blacklistedGroups.map(g => g.groupTelegramId)),
+    [blacklistedGroups],
+  )
+
+  const handleToggleBlacklist = async (group: Group) => {
+    const isBlacklisted = blacklistedIds.has(group.telegramId)
+    try {
+      if (isBlacklisted) {
+        await removeFromBlacklist.mutateAsync(group.telegramId)
+        message.success(`"${group.title}" qora ro'yxatdan olib tashlandi`)
+      } else {
+        await addToBlacklist.mutateAsync({
+          groupTelegramId: group.telegramId,
+          title: group.title || 'Nomsiz',
+          sessionId: selectedSession,
+        })
+        message.success(`"${group.title}" qora ro'yxatga qo'shildi`)
+      }
+    } catch {
+      message.error('Xatolik yuz berdi')
+    }
+  }
+
+  const allGroups = groupsData?.data || []
+  const filteredGroups = activeTab === 'blacklisted'
+    ? allGroups.filter(g => blacklistedIds.has(g.telegramId))
+    : allGroups
+
   const columns = [
     {
-      title: 'ID',
-      dataIndex: 'id',
-      key: 'id',
-      width: 100,
-      render: (id: string) => id.slice(0, 8) + '...',
+      title: 'Nomi',
+      dataIndex: 'title',
+      key: 'title',
+      ellipsis: true,
+      render: (title: string, record: Group) => (
+        <Space>
+          {blacklistedIds.has(record.telegramId) && (
+            <StopOutlined style={{ color: '#ef4444' }} />
+          )}
+          <span>{title || 'Nomsiz'}</span>
+        </Space>
+      ),
     },
-    { title: 'Nomi', dataIndex: 'title', key: 'title', ellipsis: true },
+    {
+      title: 'Telegram ID',
+      dataIndex: 'telegramId',
+      key: 'telegramId',
+      width: 160,
+    },
     {
       title: 'Turi',
       dataIndex: 'type',
@@ -81,7 +127,7 @@ const Groups = () => {
       title: 'Prioritet',
       dataIndex: 'isPriority',
       key: 'isPriority',
-      width: 120,
+      width: 100,
       render: (isPriority: boolean) =>
         isPriority ? <Tag color="blue">Top 50</Tag> : null,
     },
@@ -89,9 +135,24 @@ const Groups = () => {
       title: 'Aktivlik',
       dataIndex: 'activityScore',
       key: 'activityScore',
-      width: 100,
+      width: 90,
       sorter: (a: Group, b: Group) => a.activityScore - b.activityScore,
       render: (score: number) => score?.toFixed(1) || '0',
+    },
+    {
+      title: "Qora ro'yxat",
+      key: 'blacklist',
+      width: 130,
+      render: (_: unknown, record: Group) => (
+        <Switch
+          checked={blacklistedIds.has(record.telegramId)}
+          onChange={() => handleToggleBlacklist(record)}
+          loading={addToBlacklist.isPending || removeFromBlacklist.isPending}
+          checkedChildren="Bloklangan"
+          unCheckedChildren="Faol"
+          style={blacklistedIds.has(record.telegramId) ? { backgroundColor: '#ef4444' } : {}}
+        />
+      ),
     },
   ]
 
@@ -100,7 +161,24 @@ const Groups = () => {
       <Title level={2}>Guruhlar</Title>
 
       <StyledCard
-        title="Guruhlar Ro'yxati"
+        title={
+          <Tabs
+            activeKey={activeTab}
+            onChange={setActiveTab}
+            items={[
+              { key: 'all', label: `Barchasi (${allGroups.length})` },
+              {
+                key: 'blacklisted',
+                label: (
+                  <Badge count={blacklistedGroups.length} size="small" offset={[10, 0]}>
+                    <span>Qora ro'yxat</span>
+                  </Badge>
+                ),
+              },
+            ]}
+            style={{ marginBottom: -16 }}
+          />
+        }
         extra={
           <Space>
             <Select
@@ -121,12 +199,23 @@ const Groups = () => {
       >
         <Table
           columns={columns}
-          dataSource={groupsData?.data || []}
-          loading={isLoading}
+          dataSource={filteredGroups}
+          loading={isLoading || blacklistLoading}
           rowKey="id"
           pagination={{ pageSize: 20 }}
-          scroll={{ x: 1000 }}
+          scroll={{ x: 1200 }}
+          rowClassName={(record) =>
+            blacklistedIds.has(record.telegramId) ? 'blacklisted-row' : ''
+          }
         />
+        <style>{`
+          .blacklisted-row {
+            background-color: #fef2f2 !important;
+          }
+          .blacklisted-row:hover > td {
+            background-color: #fee2e2 !important;
+          }
+        `}</style>
       </StyledCard>
     </div>
   )

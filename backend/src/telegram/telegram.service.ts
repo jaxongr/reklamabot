@@ -2,6 +2,8 @@ import { Injectable, Logger, OnModuleInit, OnModuleDestroy } from '@nestjs/commo
 import { TelegramClient, Api } from 'telegram';
 import { StringSession } from 'telegram/sessions';
 import { computeCheck } from 'telegram/Password';
+import { ChildProcess, fork } from 'child_process';
+import * as path from 'path';
 import { PrismaService } from '../common/prisma.service';
 import { ConfigService } from '@nestjs/config';
 import { SessionStatus } from '@prisma/client';
@@ -13,13 +15,20 @@ interface PendingAuth {
   sessionId: string;
 }
 
+
 @Injectable()
 export class TelegramService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(TelegramService.name);
-  private readonly clients = new Map<string, TelegramClient>();
   private readonly pendingAuths = new Map<string, PendingAuth>();
   private readonly apiId: number;
   private readonly apiHash: string;
+
+  // ===== CHILD PROCESS =====
+  private child: ChildProcess | null = null;
+  private childReady = false;
+  private readonly pendingRequests = new Map<string, { resolve: (v: any) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }>();
+  private requestIdCounter = 0;
+  private readonly connectedSessions = new Set<string>();
 
   constructor(
     private readonly prisma: PrismaService,
@@ -35,6 +44,9 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       this.logger.warn('TELEGRAM_API_ID yoki TELEGRAM_API_HASH sozlanmagan!');
       return;
     }
+
+    this.spawnChild();
+
     try {
       await this.loadActiveSessions();
     } catch (error) {
@@ -43,25 +55,111 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   }
 
   async onModuleDestroy() {
-    for (const [sessionId, client] of this.clients) {
-      try {
-        await client.disconnect();
-        this.logger.log(`Session uzildi: ${sessionId}`);
-      } catch (error) {
-        this.logger.error(`Session uzishda xatolik ${sessionId}:`, error.message);
-      }
+    // Disconnect pending auth clients (main thread)
+    for (const [, pending] of this.pendingAuths) {
+      try { await pending.client.disconnect(); } catch {}
     }
-    this.clients.clear();
+    this.pendingAuths.clear();
+
+    // Terminate child process
+    if (this.child) {
+      try { await this.sendToChild('disconnectAll'); } catch {}
+      this.child.kill();
+      this.child = null;
+    }
   }
 
-  /**
-   * 1-qadam: Telefon raqamga kod yuborish
-   */
+  // ============================================================
+  // CHILD PROCESS MANAGEMENT
+  // ============================================================
+
+  private spawnChild() {
+    const childPath = path.join(__dirname, 'telegram-worker.js');
+    this.logger.log(`Spawning telegram posting child process: ${childPath}`);
+
+    this.child = fork(childPath, [String(this.apiId), this.apiHash], {
+      stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
+    });
+
+    this.child.on('message', (msg: any) => this.handleChildMessage(msg));
+
+    this.child.on('error', (err) => {
+      this.logger.error(`Telegram child process error: ${err.message}`);
+    });
+
+    this.child.on('exit', (code) => {
+      this.logger.warn(`Telegram child process exited with code ${code}`);
+      this.childReady = false;
+      this.connectedSessions.clear();
+
+      for (const [, pending] of this.pendingRequests) {
+        clearTimeout(pending.timer);
+        pending.reject(new Error('Child process exited'));
+      }
+      this.pendingRequests.clear();
+
+      // Auto-restart
+      if (code !== 0) {
+        setTimeout(() => {
+          this.logger.log('Restarting telegram child process...');
+          this.spawnChild();
+          setTimeout(() => {
+            this.loadActiveSessions().catch((err) =>
+              this.logger.warn('Session reload after child restart: ' + err.message),
+            );
+          }, 2000);
+        }, 5000);
+      }
+    });
+
+    this.childReady = true;
+  }
+
+  private handleChildMessage(msg: any) {
+    if (msg.type === 'response') {
+      const pending = this.pendingRequests.get(msg.id);
+      if (pending) {
+        clearTimeout(pending.timer);
+        this.pendingRequests.delete(msg.id);
+        if (msg.success) {
+          pending.resolve(msg.data);
+        } else {
+          pending.reject(new Error(msg.error || 'Child request failed'));
+        }
+      }
+    } else if (msg.type === 'log') {
+      if (msg.level === 'error') this.logger.error(`[Worker] ${msg.message}`);
+      else if (msg.level === 'warn') this.logger.warn(`[Worker] ${msg.message}`);
+      else this.logger.log(`[Worker] ${msg.message}`);
+    }
+  }
+
+  private sendToChild(type: string, data: Record<string, any> = {}): Promise<any> {
+    return new Promise((resolve, reject) => {
+      if (!this.child || !this.childReady) {
+        reject(new Error('Child process not running'));
+        return;
+      }
+      const id = String(++this.requestIdCounter);
+      const timer = setTimeout(() => {
+        if (this.pendingRequests.has(id)) {
+          this.pendingRequests.delete(id);
+          reject(new Error('Child request timeout (120s)'));
+        }
+      }, 120_000);
+      this.pendingRequests.set(id, { resolve, reject, timer });
+      this.child.send({ type, id, ...data });
+    });
+  }
+
+  // ============================================================
+  // AUTH FLOW (main thread — brief, short-lived)
+  // ============================================================
+
   async sendCode(userId: string, phone: string, sessionName?: string): Promise<{
     sessionId: string;
     phoneCodeHash: string;
   }> {
-    // DB da session yaratish
     const session = await this.prisma.session.create({
       data: {
         userId,
@@ -71,7 +169,6 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       },
     });
 
-    // Yangi TelegramClient yaratish
     const stringSession = new StringSession('');
     const client = new TelegramClient(stringSession, this.apiId, this.apiHash, {
       connectionRetries: 5,
@@ -92,8 +189,8 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       );
 
       const phoneCodeHash = (result as any).phoneCodeHash;
+      const codeType = (result as any).type?.className || 'unknown';
 
-      // Pending auth ni saqlash
       this.pendingAuths.set(session.id, {
         client,
         phone,
@@ -101,14 +198,9 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
         sessionId: session.id,
       });
 
-      this.logger.log(`Kod yuborildi: ${phone}, session: ${session.id}`);
-
-      return {
-        sessionId: session.id,
-        phoneCodeHash,
-      };
+      this.logger.log(`Kod yuborildi: ${phone}, session: ${session.id}, type: ${codeType}`);
+      return { sessionId: session.id, phoneCodeHash };
     } catch (error) {
-      // Xatolik bo'lsa sessionni o'chirish
       await this.prisma.session.delete({ where: { id: session.id } }).catch(() => {});
       await client.disconnect().catch(() => {});
       this.logger.error(`Kod yuborishda xatolik: ${error.message}`);
@@ -116,9 +208,6 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  /**
-   * 2-qadam: Kodni tasdiqlash va sign in
-   */
   async signIn(sessionId: string, code: string, password?: string): Promise<{
     success: boolean;
     groupsCount: number;
@@ -131,18 +220,16 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     const { client, phone, phoneCodeHash } = pending;
 
     try {
-      // Faqat parol kelgan bo'lsa — 2FA checkPassword
       if (password && !code) {
         this.logger.log(`2FA parol bilan kirish: ${sessionId}`);
         const srpPassword = await client.invoke(new Api.account.GetPassword());
-        const passwordSrpResult = await client.invoke(
+        await client.invoke(
           new Api.auth.CheckPassword({
             password: await computeCheck(srpPassword, password),
           }),
         );
         this.logger.log(`2FA muvaffaqiyatli: ${sessionId}`);
       } else {
-        // Kod bilan sign in
         this.logger.log(`Kod bilan sign in: ${sessionId}, kod: ${code}`);
         try {
           await client.invoke(
@@ -155,12 +242,8 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
         } catch (error: any) {
           this.logger.error(`SignIn xatolik: errorMessage=${error.errorMessage}, message=${error.message}`);
 
-          // 2FA parol kerak
           if (error.errorMessage === 'SESSION_PASSWORD_NEEDED') {
-            if (!password) {
-              throw new Error('2FA_REQUIRED');
-            }
-            // 2FA parol bilan checkPassword
+            if (!password) throw new Error('2FA_REQUIRED');
             const srpPassword = await client.invoke(new Api.account.GetPassword());
             await client.invoke(
               new Api.auth.CheckPassword({
@@ -170,7 +253,6 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
           } else if (error.errorMessage === 'PHONE_CODE_INVALID') {
             throw new Error('Kod noto\'g\'ri. Qayta tekshiring.');
           } else if (error.errorMessage === 'PHONE_CODE_EXPIRED') {
-            // Kodni qayta yuborish
             this.logger.log(`Kod muddati o'tgan, qayta yuborilmoqda: ${phone}`);
             try {
               const resendResult = await client.invoke(
@@ -180,17 +262,12 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
                 }),
               );
               const newHash = (resendResult as any).phoneCodeHash;
-              // Pending auth ni yangilash
               this.pendingAuths.set(sessionId, {
-                client,
-                phone,
-                phoneCodeHash: newHash,
-                sessionId,
+                client, phone, phoneCodeHash: newHash, sessionId,
               });
               throw new Error('RESEND_CODE');
             } catch (resendError: any) {
               if (resendError.message === 'RESEND_CODE') throw resendError;
-              // Resend ham ishlamasa — tozalash
               this.logger.error(`Kodni qayta yuborishda xatolik: ${resendError.message}`);
               this.pendingAuths.delete(sessionId);
               await client.disconnect().catch(() => {});
@@ -203,27 +280,26 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
         }
       }
 
-      // Session string ni saqlash
+      // Save session string
       const sessionString = (client.session as StringSession).save();
 
-      // DB ni yangilash
       await this.prisma.session.update({
         where: { id: sessionId },
-        data: {
-          sessionString,
-          status: SessionStatus.ACTIVE,
-        },
+        data: { sessionString, status: SessionStatus.ACTIVE },
       });
 
-      // Clientni ro'yxatga olish
-      this.clients.set(sessionId, client);
+      // Disconnect auth client from main thread
+      try { await client.disconnect(); } catch {}
       this.pendingAuths.delete(sessionId);
 
-      // Guruhlarni sinxronlash
+      // Connect in worker for long-running usage
+      await this.sendToChild('connect', { sessionId, sessionString });
+      this.connectedSessions.add(sessionId);
+
+      // Sync groups
       const groupsCount = await this.syncGroups(sessionId);
 
       this.logger.log(`Session muvaffaqiyatli ulandi: ${sessionId}, guruhlar: ${groupsCount}`);
-
       return { success: true, groupsCount };
     } catch (error: any) {
       if (error.message === '2FA_REQUIRED') throw error;
@@ -233,8 +309,6 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
 
       this.pendingAuths.delete(sessionId);
       await client.disconnect().catch(() => {});
-
-      // Xatolik bo'lsa sessionni o'chirish
       await this.prisma.session.delete({ where: { id: sessionId } }).catch(() => {});
 
       this.logger.error(`Sign in xatolik: ${error.errorMessage || error.message}`);
@@ -242,17 +316,246 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  /**
-   * Guruhlarni Telegram dan sinxronlash
-   */
+  // ============================================================
+  // SESSION MANAGEMENT (via worker)
+  // ============================================================
+
+  private async loadActiveSessions(): Promise<void> {
+    const sessions = await this.prisma.session.findMany({
+      where: {
+        status: SessionStatus.ACTIVE,
+        isFrozen: false,
+        sessionString: { not: null },
+      },
+    });
+
+    this.logger.log(`${sessions.length} ta faol session yuklanmoqda...`);
+
+    // Parallel ulash — 5 tadan batch
+    for (let i = 0; i < sessions.length; i += 5) {
+      const batch = sessions.slice(i, i + 5);
+      await Promise.allSettled(
+        batch.map(session =>
+          this.connectSession(session.id)
+            .then(() => this.logger.log(`Session yuklandi: ${session.id} (${session.name})`))
+            .catch(error => this.logger.error(`Session yuklanmadi ${session.id}: ${error.message}`))
+        ),
+      );
+    }
+  }
+
+  async connectSession(sessionId: string): Promise<void> {
+    const session = await this.prisma.session.findUnique({
+      where: { id: sessionId },
+    });
+
+    if (!session?.sessionString) {
+      throw new Error('Session yoki session string topilmadi');
+    }
+
+    if (session.isFrozen) {
+      throw new Error('Session muzlatilgan — avval eritib oling');
+    }
+
+    // Already connected?
+    if (this.connectedSessions.has(sessionId)) {
+      try {
+        const connected = await this.sendToChild('isConnected', { sessionId });
+        if (connected) return;
+      } catch {}
+    }
+
+    try {
+      await this.sendToChild('connect', { sessionId, sessionString: session.sessionString });
+      this.connectedSessions.add(sessionId);
+      this.logger.log(`Session ulandi (worker): ${sessionId}`);
+    } catch (error) {
+      this.logger.error(`Session ulashda xatolik ${sessionId}: ${error.message}`);
+
+      if (error.message?.includes('AUTH_KEY_UNREGISTERED') || error.message?.includes('SESSION_REVOKED')) {
+        await this.markSessionDead(sessionId);
+      }
+
+      throw error;
+    }
+  }
+
+  async disconnectSession(sessionId: string): Promise<void> {
+    if (this.connectedSessions.has(sessionId)) {
+      try { await this.sendToChild('disconnect', { sessionId }); } catch {}
+      this.connectedSessions.delete(sessionId);
+    }
+
+    await this.prisma.session.update({
+      where: { id: sessionId },
+      data: { status: SessionStatus.INACTIVE },
+    });
+
+    this.logger.log(`Session uzildi: ${sessionId}`);
+  }
+
+  async deleteSession(sessionId: string): Promise<void> {
+    if (this.connectedSessions.has(sessionId)) {
+      try { await this.sendToChild('disconnect', { sessionId }); } catch {}
+      this.connectedSessions.delete(sessionId);
+    }
+
+    // Clean up pending auth
+    const pending = this.pendingAuths.get(sessionId);
+    if (pending) {
+      try { await pending.client.disconnect(); } catch {}
+      this.pendingAuths.delete(sessionId);
+    }
+
+    await this.prisma.session.update({
+      where: { id: sessionId },
+      data: { status: SessionStatus.DELETED },
+    });
+
+    this.logger.log(`Session o'chirildi: ${sessionId}`);
+  }
+
+  private async markSessionDead(sessionId: string): Promise<void> {
+    await this.prisma.session.update({
+      where: { id: sessionId },
+      data: {
+        status: SessionStatus.DELETED,
+        sessionString: null,
+        isFrozen: true,
+        frozenAt: new Date(),
+        freezeCount: { increment: 1 },
+      },
+    });
+    this.connectedSessions.delete(sessionId);
+    this.logger.warn(`Session o'lgan deb belgilandi (DELETED): ${sessionId}`);
+  }
+
+  async markSessionFrozen(sessionId: string): Promise<void> {
+    await this.prisma.session.update({
+      where: { id: sessionId },
+      data: {
+        isFrozen: true,
+        frozenAt: new Date(),
+        freezeCount: { increment: 1 },
+      },
+    });
+    this.logger.warn(`Session muzlatildi: ${sessionId}`);
+  }
+
+  // ============================================================
+  // MESSAGING (via worker)
+  // ============================================================
+
+  async sendMessage(
+    sessionId: string,
+    groupTelegramId: string,
+    messageText: string,
+  ): Promise<{ messageId?: number }> {
+    if (!this.connectedSessions.has(sessionId)) {
+      throw new Error(`Session ${sessionId} ulangan emas`);
+    }
+
+    try {
+      const result = await this.sendToChild('sendMessage', {
+        sessionId,
+        peer: groupTelegramId,
+        message: messageText,
+      });
+      return { messageId: result?.messageId };
+    } catch (error: any) {
+      const msg = error.message || '';
+
+      // Parse error types from worker
+      if (msg.startsWith('FLOOD_WAIT:')) {
+        const waitSeconds = parseInt(msg.split(':')[1]) || 60;
+        this.logger.warn(`FLOOD_WAIT ${waitSeconds}s — session: ${sessionId}`);
+        throw new Error(`FLOOD_WAIT:${waitSeconds}`);
+      }
+      if (msg.startsWith('SLOWMODE_WAIT:')) {
+        const waitSeconds = parseInt(msg.split(':')[1]) || 300;
+        this.logger.warn(`SLOWMODE_WAIT ${waitSeconds}s — group: ${groupTelegramId}`);
+        throw new Error(`SLOWMODE_WAIT:${waitSeconds}`);
+      }
+      if (msg.startsWith('WRITE_FORBIDDEN:')) {
+        const parts = msg.split(':');
+        this.logger.warn(`WRITE_FORBIDDEN [${parts[1]}] — session: ${sessionId}, group: ${groupTelegramId}`);
+        throw error;
+      }
+      if (msg.startsWith('PEER_INVALID:')) {
+        throw new Error(`CHANNEL_INVALID:${groupTelegramId}`);
+      }
+
+      // Session dead
+      if (msg.includes('AUTH_KEY_UNREGISTERED') || msg.includes('SESSION_REVOKED')) {
+        await this.markSessionDead(sessionId);
+        throw new Error(`SESSION_DEAD:${sessionId}`);
+      }
+
+      throw error;
+    }
+  }
+
+  async deleteMessage(
+    sessionId: string,
+    chatId: string,
+    messageId: number,
+  ): Promise<boolean> {
+    if (!this.connectedSessions.has(sessionId)) {
+      this.logger.warn(`Session ${sessionId} ulangan emas — xabar o'chirilmadi`);
+      return false;
+    }
+
+    try {
+      return await this.sendToChild('deleteMessage', { sessionId, chatId, messageId });
+    } catch {
+      return false;
+    }
+  }
+
+  async deleteAdMessages(
+    postHistories: Array<{
+      messageId: number | null;
+      groupTelegramId: string;
+      sessionId: string;
+    }>,
+  ): Promise<{ deleted: number; failed: number }> {
+    let deleted = 0;
+    let failed = 0;
+
+    const bySession = new Map<string, Array<{ messageId: number; chatId: string }>>();
+    for (const h of postHistories) {
+      if (!h.messageId) continue;
+      const existing = bySession.get(h.sessionId) || [];
+      existing.push({ messageId: h.messageId, chatId: h.groupTelegramId });
+      bySession.set(h.sessionId, existing);
+    }
+
+    const tasks = Array.from(bySession.entries()).map(async ([sessionId, messages]) => {
+      for (const msg of messages) {
+        const success = await this.deleteMessage(sessionId, msg.chatId, msg.messageId);
+        if (success) deleted++;
+        else failed++;
+        await new Promise(r => setTimeout(r, 200));
+      }
+    });
+
+    await Promise.allSettled(tasks);
+
+    this.logger.log(`E'lon xabarlari o'chirildi: ${deleted} muvaffaqiyat, ${failed} xato`);
+    return { deleted, failed };
+  }
+
+  // ============================================================
+  // GROUP SYNC (dialogs from worker, DB in main thread)
+  // ============================================================
+
   async syncGroups(sessionId: string): Promise<number> {
-    const client = this.clients.get(sessionId);
-    if (!client) {
+    if (!this.connectedSessions.has(sessionId)) {
       throw new Error('Session ulangan emas');
     }
 
     try {
-      const dialogs = await client.getDialogs({ limit: 500 });
+      const dialogResult = await this.sendToChild('getDialogs', { sessionId, limit: 500 });
       const groups: Array<{
         telegramId: string;
         title: string;
@@ -261,41 +564,25 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
         memberCount: number | null;
       }> = [];
 
-      for (const dialog of dialogs) {
-        // Faqat guruhlar va supergruhlar
-        if (dialog.isGroup || dialog.isChannel) {
-          const entity = dialog.entity as any;
-          let type: 'GROUP' | 'SUPERGROUP' | 'CHANNEL' = 'GROUP';
-
-          if (dialog.isChannel && entity?.megagroup) {
-            type = 'SUPERGROUP';
-          } else if (dialog.isChannel) {
-            type = 'CHANNEL';
-          }
-
-          // Channellarda admin bo'lmasa yozolmaymiz — o'tkazib yuboramiz
-          if (type === 'CHANNEL' && !entity?.adminRights && !entity?.creator) {
-            continue;
-          }
-
-          groups.push({
-            telegramId: dialog.id?.toString() || '',
-            title: dialog.title || 'Nomsiz',
-            username: entity?.username || null,
-            type,
-            memberCount: entity?.participantsCount || null,
-          });
-        }
+      for (const d of dialogResult.groups) {
+        groups.push({
+          telegramId: d.id,
+          title: d.title || 'Nomsiz',
+          username: null,
+          type: d.isChannel ? 'CHANNEL' : (d.isGroup ? 'GROUP' : 'GROUP'),
+          memberCount: null,
+        });
       }
 
-      // Mavjud guruhlarni olish
+      // DB operations
+      const telegramGroupIds = new Set(groups.map(g => g.telegramId));
+
       const existingGroups = await this.prisma.group.findMany({
         where: { sessionId },
-        select: { telegramId: true },
+        select: { id: true, telegramId: true },
       });
       const existingIds = new Set(existingGroups.map(g => g.telegramId));
 
-      // Yangi guruhlarni qo'shish
       const newGroups = groups.filter(g => !existingIds.has(g.telegramId));
 
       if (newGroups.length > 0) {
@@ -312,7 +599,19 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
         });
       }
 
-      // Session statistikasini yangilash
+      const staleGroups = existingGroups.filter(g => !telegramGroupIds.has(g.telegramId));
+      if (staleGroups.length > 0) {
+        await this.prisma.group.deleteMany({
+          where: { id: { in: staleGroups.map(g => g.id) } },
+        });
+        this.logger.log(`${staleGroups.length} ta eskirgan guruh o'chirildi`);
+      }
+
+      await this.prisma.group.updateMany({
+        where: { sessionId, isSkipped: true },
+        data: { isSkipped: false, hasRestrictions: false, skipReason: null },
+      });
+
       const totalGroups = await this.prisma.group.count({ where: { sessionId } });
       const activeGroups = await this.prisma.group.count({
         where: { sessionId, isActive: true, isSkipped: false },
@@ -320,14 +619,10 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
 
       await this.prisma.session.update({
         where: { id: sessionId },
-        data: {
-          totalGroups,
-          activeGroups,
-          lastSyncAt: new Date(),
-        },
+        data: { totalGroups, activeGroups, lastSyncAt: new Date() },
       });
 
-      this.logger.log(`Guruhlar sinxronlandi: ${sessionId} — jami: ${totalGroups}, yangi: ${newGroups.length}`);
+      this.logger.log(`Guruhlar sinxronlandi: ${sessionId} — jami: ${totalGroups}, yangi: ${newGroups.length}, o'chirildi: ${staleGroups.length}`);
       return totalGroups;
     } catch (error) {
       this.logger.error(`Guruhlar sinxronlashda xatolik: ${error.message}`);
@@ -335,304 +630,10 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  /**
-   * Barcha faol sessionlarni yuklash (server qayta ishga tushganda)
-   */
-  private async loadActiveSessions(): Promise<void> {
-    const sessions = await this.prisma.session.findMany({
-      where: {
-        status: SessionStatus.ACTIVE,
-        isFrozen: false,
-        sessionString: { not: null },
-      },
-    });
+  // ============================================================
+  // QUERY / STATUS (no gramJS needed)
+  // ============================================================
 
-    this.logger.log(`${sessions.length} ta faol session yuklanmoqda...`);
-
-    for (const session of sessions) {
-      try {
-        await this.connectSession(session.id);
-        this.logger.log(`Session yuklandi: ${session.id} (${session.name})`);
-      } catch (error) {
-        this.logger.error(`Session yuklanmadi ${session.id}: ${error.message}`);
-      }
-    }
-  }
-
-  /**
-   * Mavjud sessionni qayta ulash (sessionString bilan)
-   */
-  async connectSession(sessionId: string): Promise<void> {
-    const session = await this.prisma.session.findUnique({
-      where: { id: sessionId },
-    });
-
-    if (!session?.sessionString) {
-      throw new Error('Session yoki session string topilmadi');
-    }
-
-    // Agar allaqachon ulangan bo'lsa — qayta ulamaymiz
-    if (this.clients.has(sessionId)) {
-      const existing = this.clients.get(sessionId)!;
-      if (existing.connected) return;
-      // Uzilgan bo'lsa — o'chirib qayta ulaymiz
-      try { await existing.disconnect(); } catch {}
-      this.clients.delete(sessionId);
-    }
-
-    const stringSession = new StringSession(session.sessionString);
-    const client = new TelegramClient(stringSession, this.apiId, this.apiHash, {
-      connectionRetries: 5,
-      requestRetries: 3,
-    });
-
-    try {
-      await client.connect();
-
-      // Session hali ham ishlayaptimi tekshiramiz
-      await client.getMe();
-
-      this.clients.set(sessionId, client);
-      this.logger.log(`Session ulandi: ${sessionId}`);
-    } catch (error) {
-      await client.disconnect().catch(() => {});
-      this.logger.error(`Session ulashda xatolik ${sessionId}: ${error.message}`);
-
-      // AUTH_KEY_UNREGISTERED bo'lsa — session o'lgan
-      if (error.message?.includes('AUTH_KEY_UNREGISTERED') || error.message?.includes('SESSION_REVOKED')) {
-        await this.markSessionDead(sessionId);
-      }
-
-      throw error;
-    }
-  }
-
-  /**
-   * Sessionni uzish
-   */
-  async disconnectSession(sessionId: string): Promise<void> {
-    const client = this.clients.get(sessionId);
-    if (client) {
-      try {
-        await client.disconnect();
-      } catch {}
-      this.clients.delete(sessionId);
-    }
-
-    await this.prisma.session.update({
-      where: { id: sessionId },
-      data: { status: SessionStatus.INACTIVE },
-    });
-
-    this.logger.log(`Session uzildi: ${sessionId}`);
-  }
-
-  /**
-   * Sessionni o'chirish (DB dan ham)
-   */
-  async deleteSession(sessionId: string): Promise<void> {
-    const client = this.clients.get(sessionId);
-    if (client) {
-      try { await client.disconnect(); } catch {}
-      this.clients.delete(sessionId);
-    }
-
-    await this.prisma.session.update({
-      where: { id: sessionId },
-      data: { status: SessionStatus.DELETED },
-    });
-
-    this.logger.log(`Session o'chirildi: ${sessionId}`);
-  }
-
-  /**
-   * O'lgan sessionni belgilash
-   */
-  private async markSessionDead(sessionId: string): Promise<void> {
-    await this.prisma.session.update({
-      where: { id: sessionId },
-      data: {
-        status: SessionStatus.BANNED,
-        isFrozen: true,
-        frozenAt: new Date(),
-        freezeCount: { increment: 1 },
-      },
-    });
-    this.logger.warn(`Session o'lgan deb belgilandi: ${sessionId}`);
-  }
-
-  /**
-   * Frozen session
-   */
-  async markSessionFrozen(sessionId: string): Promise<void> {
-    await this.prisma.session.update({
-      where: { id: sessionId },
-      data: {
-        isFrozen: true,
-        frozenAt: new Date(),
-        freezeCount: { increment: 1 },
-      },
-    });
-    this.logger.warn(`Session muzlatildi: ${sessionId}`);
-  }
-
-  /**
-   * Guruhga xabar yuborish
-   */
-  async sendMessage(
-    sessionId: string,
-    groupTelegramId: string,
-    messageText: string,
-  ): Promise<{ messageId?: number }> {
-    const client = this.clients.get(sessionId);
-    if (!client) {
-      throw new Error(`Session ${sessionId} ulangan emas`);
-    }
-
-    if (!client.connected) {
-      throw new Error(`Session ${sessionId} aloqa uzilgan`);
-    }
-
-    try {
-      const result = await client.sendMessage(groupTelegramId, {
-        message: messageText,
-      });
-
-      return { messageId: result?.id };
-    } catch (error: any) {
-      // FLOOD_WAIT
-      if (error.errorMessage?.includes('FLOOD_WAIT') || error.message?.includes('FLOOD_WAIT')) {
-        const match = (error.errorMessage || error.message).match(/(\d+)/);
-        const waitSeconds = match ? parseInt(match[1]) : 60;
-        this.logger.warn(`FLOOD_WAIT ${waitSeconds}s — session: ${sessionId}`);
-        throw new Error(`FLOOD_WAIT:${waitSeconds}`);
-      }
-
-      // SLOWMODE
-      if (error.errorMessage?.includes('SLOWMODE_WAIT') || error.seconds) {
-        const waitSeconds = error.seconds || 300;
-        this.logger.warn(`SLOWMODE_WAIT ${waitSeconds}s — group: ${groupTelegramId}`);
-        throw new Error(`SLOWMODE_WAIT:${waitSeconds}`);
-      }
-
-      // Yozish taqiqlangan
-      if (
-        error.errorMessage?.includes('CHAT_WRITE_FORBIDDEN') ||
-        error.errorMessage?.includes('USER_BANNED_IN_CHANNEL') ||
-        error.errorMessage?.includes('CHANNEL_PRIVATE')
-      ) {
-        throw new Error(`WRITE_FORBIDDEN:${groupTelegramId}`);
-      }
-
-      // Cheklangan guruh
-      if (
-        error.errorMessage?.includes('CHAT_RESTRICTED') ||
-        error.errorMessage?.includes('CHAT_SEND_PLAIN_FORBIDDEN') ||
-        error.errorMessage?.includes('CHAT_GUEST_SEND_FORBIDDEN') ||
-        error.errorMessage?.includes('PREMIUM_ACCOUNT_REQUIRED') ||
-        error.errorMessage?.includes('CHAT_SEND_MEDIA_FORBIDDEN')
-      ) {
-        throw new Error(`CHAT_RESTRICTED:${groupTelegramId}`);
-      }
-
-      // Session o'lgan
-      if (
-        error.errorMessage?.includes('AUTH_KEY_UNREGISTERED') ||
-        error.errorMessage?.includes('SESSION_REVOKED')
-      ) {
-        await this.markSessionDead(sessionId);
-        this.clients.delete(sessionId);
-        throw new Error(`SESSION_DEAD:${sessionId}`);
-      }
-
-      throw error;
-    }
-  }
-
-  /**
-   * Bitta xabarni o'chirish
-   */
-  async deleteMessage(
-    sessionId: string,
-    chatId: string,
-    messageId: number,
-  ): Promise<boolean> {
-    const client = this.clients.get(sessionId);
-    if (!client || !client.connected) {
-      this.logger.warn(`Session ${sessionId} ulangan emas — xabar o'chirilmadi`);
-      return false;
-    }
-
-    try {
-      await client.invoke(
-        new Api.messages.DeleteMessages({
-          id: [messageId],
-          revoke: true,
-        }),
-      );
-      return true;
-    } catch (error: any) {
-      // Channel/Supergroup uchun boshqa API
-      try {
-        const peer = await client.getInputEntity(chatId);
-        await client.invoke(
-          new Api.channels.DeleteMessages({
-            channel: peer as any,
-            id: [messageId],
-          }),
-        );
-        return true;
-      } catch (innerError: any) {
-        this.logger.warn(
-          `Xabar o'chirishda xatolik (session: ${sessionId.slice(0, 8)}..., ` +
-          `chat: ${chatId}, msg: ${messageId}): ${innerError.message}`,
-        );
-        return false;
-      }
-    }
-  }
-
-  /**
-   * E'lon xabarlarini guruhlardan o'chirish (PostHistory[] dan)
-   */
-  async deleteAdMessages(
-    postHistories: Array<{
-      messageId: number | null;
-      groupTelegramId: string;
-      sessionId: string;
-    }>,
-  ): Promise<{ deleted: number; failed: number }> {
-    let deleted = 0;
-    let failed = 0;
-
-    // Session bo'yicha guruhlash — parallel o'chirish
-    const bySession = new Map<string, Array<{ messageId: number; chatId: string }>>();
-    for (const h of postHistories) {
-      if (!h.messageId) continue;
-      const existing = bySession.get(h.sessionId) || [];
-      existing.push({ messageId: h.messageId, chatId: h.groupTelegramId });
-      bySession.set(h.sessionId, existing);
-    }
-
-    const tasks = Array.from(bySession.entries()).map(async ([sessionId, messages]) => {
-      for (const msg of messages) {
-        const success = await this.deleteMessage(sessionId, msg.chatId, msg.messageId);
-        if (success) deleted++;
-        else failed++;
-        // Anti-spam: kichik delay
-        await new Promise(r => setTimeout(r, 200));
-      }
-    });
-
-    await Promise.allSettled(tasks);
-
-    this.logger.log(`E'lon xabarlari o'chirildi: ${deleted} muvaffaqiyat, ${failed} xato`);
-    return { deleted, failed };
-  }
-
-  /**
-   * Foydalanuvchining ulangan sessionlari
-   */
   async getUserSessions(userId: string) {
     return this.prisma.session.findMany({
       where: {
@@ -646,52 +647,30 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     });
   }
 
-  /**
-   * Session ulangan va ishlayaptimi
-   */
   isClientConnected(sessionId: string): boolean {
-    const client = this.clients.get(sessionId);
-    return !!client && client.connected;
+    return this.connectedSessions.has(sessionId);
   }
 
-  /**
-   * Ulangan sessionlar soni
-   */
   getConnectedCount(): number {
-    let count = 0;
-    for (const [, client] of this.clients) {
-      if (client.connected) count++;
-    }
-    return count;
+    return this.connectedSessions.size;
   }
 
-  /**
-   * Session ulanish holatini tekshirish
-   */
   async checkSessionConnection(sessionId: string): Promise<{
     connected: boolean;
     error?: string;
   }> {
-    const client = this.clients.get(sessionId);
-    if (!client) {
+    if (!this.connectedSessions.has(sessionId)) {
       return { connected: false, error: 'Client topilmadi' };
     }
 
-    if (!client.connected) {
-      return { connected: false, error: 'Aloqa uzilgan' };
-    }
-
     try {
-      await client.getMe();
-      return { connected: true };
+      const connected = await this.sendToChild('isConnected', { sessionId });
+      return { connected };
     } catch (error: any) {
       return { connected: false, error: error.message };
     }
   }
 
-  /**
-   * Barcha sessionlarning ulanish holatini tekshirish
-   */
   async checkAllSessionConnections(sessionIds: string[]): Promise<
     Array<{ sessionId: string; connected: boolean; error?: string }>
   > {
@@ -714,16 +693,10 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     });
   }
 
-  /**
-   * Pending auth bormi
-   */
   hasPendingAuth(sessionId: string): boolean {
     return this.pendingAuths.has(sessionId);
   }
 
-  /**
-   * Pending auth ni bekor qilish
-   */
   async cancelPendingAuth(sessionId: string): Promise<void> {
     const pending = this.pendingAuths.get(sessionId);
     if (pending) {
@@ -731,5 +704,19 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       this.pendingAuths.delete(sessionId);
     }
     await this.prisma.session.delete({ where: { id: sessionId } }).catch(() => {});
+  }
+
+  /**
+   * Resolve user accessHash from monitor session entity cache.
+   * Used by TG SMS service when it can't resolve user by phone.
+   */
+  async resolveUser(telegramId: string): Promise<{ id: string; accessHash: string } | null> {
+    if (!this.child || !this.childReady) return null;
+    try {
+      const result = await this.sendToChild('resolveUser', { telegramId });
+      return result || null;
+    } catch {
+      return null;
+    }
   }
 }

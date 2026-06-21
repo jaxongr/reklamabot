@@ -23,9 +23,14 @@ model User {
   phoneNumber   String?
   language      String    @default("uz")
   timezone       String    @default("Asia/Tashkent")
+  gender        String?   // MALE / FEMALE
+  blockReason   String?   // Bloklash sababi
+  blockedAt     DateTime? // Qachon bloklangan
   role          UserRole  @default(USER)
   status        UserStatus @default(ACTIVE)
   isActive      Boolean   @default(true)
+  isRegistered  Boolean   @default(false)
+  registeredAt  DateTime?
 
   // Subscription
   subscription      Subscription?
@@ -40,9 +45,63 @@ model User {
   createdAds      Ad[]       @relation("CreatedBy")
   closedAds       Ad[]       @relation("ClosedBy")
 
+  // Monitor & Orders
+  monitorSessions MonitorSession[]
+  orders          Order[]
+  blockedUsers    BlockedUser[]
+
   // Brand ad
   brandAdText    String?    @db.Text
   brandAdEnabled Boolean   @default(false)
+
+  // Master/Tobe tizimi
+  isMaster        Boolean   @default(false)
+  masterId        String?
+  master          User?     @relation("MasterTobes", fields: [masterId], references: [id])
+  tobes           User[]    @relation("MasterTobes")
+  refCode         String?   @unique
+
+  // Broadcast xabar (master/tobe uchun)
+  broadcastMessage String?  @db.Text
+
+  // Driver
+  driverProfile   DriverProfile?
+  driverOffers    DriverOffer[]
+
+  // Tasks 14, 19: Dispetcher xususiyatlari
+  adPhoneNumbers    String[]          // E'lon uchun telefon raqamlar
+  dispatcherBalance Float     @default(0) // Dispetcher balansi
+
+  // Tasks 16-18: Kommunikatsiya
+  notifications     UserNotification[]
+  chatParticipants  ChatParticipant[]
+  chatMessages      ChatMessage[]
+  supportTickets    SupportTicket[]
+  supportMessages   SupportMessage[]
+
+  // Task 19: Balans
+  balanceTransactions BalanceTransaction[]
+
+  // Buxgalteriya
+  accountingEntries AccountingEntry[] @relation("AccountingEntries")
+
+  // Reyting
+  ratingsGiven      UserRating[] @relation("RatingsGiven")
+  ratingsReceived   UserRating[] @relation("RatingsReceived")
+
+  // FCM Push Notification
+  fcmToken        String?
+  isLineActive    Boolean   @default(true)  // Linya: e'lon bildirishnomasi olish
+
+  // Online status
+  isOnline        Boolean   @default(false)
+  lastOnlineAt    DateTime?
+
+  // GPS joylashuv (dispetcher/driver — barcha foydalanuvchilar uchun)
+  lastLat         Float?
+  lastLng         Float?
+  lastLocationAt  DateTime?
+  lastCity        String?
 
   createdAt       DateTime   @default(now())
   updatedAt       DateTime   @updatedAt
@@ -50,6 +109,10 @@ model User {
   @@index([telegramId])
   @@index([role])
   @@index([status])
+  @@index([masterId])
+  @@index([isOnline])
+  @@index([lastLocationAt])
+  @@index([role, lastLocationAt])
 }
 
 enum UserRole {
@@ -57,6 +120,7 @@ enum UserRole {
   ADMIN
   DISPATCHER
   SUPER_ADMIN
+  DRIVER
 }
 
 enum UserStatus {
@@ -220,7 +284,7 @@ model Group {
   session         Session   @relation(fields: [sessionId], references: [id], onDelete: Cascade)
 
   // Telegram data
-  telegramId      String    @unique
+  telegramId      String
   title           String
   username        String?
   type            GroupType
@@ -279,7 +343,7 @@ model Ad {
   description     String?   @db.Text
   content         String    @db.Text
   mediaUrls       String[]
-  mediaType       MediaType
+  mediaType       MediaType   @default(TEXT)
 
   // Ad status
   status          AdStatus  @default(DRAFT)
@@ -305,6 +369,19 @@ model Ad {
 
   // Combination
   combineWithAds  String[]
+
+  // Yuk yopish tafsilotlari (yopish vaqtida to'ldiriladi)
+  closedAmount    Float?      // Qancha summaga yopildi
+  cargoFrom       String?     // Qayerdan
+  cargoTo         String?     // Qayerga
+  cargoType       String?     // Yuk turi
+  cargoWeight     Float?      // Nechchi tonna
+  vehicleType     String?     // Mashina turi (fura, isuzu, gazel va h.k.)
+  distance        Float?      // Masofa (km)
+  isManualEntry   Boolean     @default(false) // Dashboard dan qo'lda kiritilganmi
+
+  // Session tanlash (tarqatish uchun)
+  selectedSessions String[]   // Tanlangan session ID'lari (bo'sh = hammasi)
 
   // Distribution settings
   selectedGroups String[]
@@ -522,6 +599,219 @@ model SystemStatistics {
 }
 
 // ============================================================
+// LOCATIONS (O'zbekiston viloyat/tuman/shaharlar)
+// ============================================================
+
+model Location {
+  id        String   @id @default(cuid())
+  name      String   // Toshkent, Chirchiq, Olmaliq
+  region    String   // Toshkent viloyati
+  type      String   @default("CITY") // REGION, CITY, DISTRICT
+  lat       Float?   // Kenglik (latitude)
+  lng       Float?   // Uzunlik (longitude)
+  keywords  String?  @db.Text // Xato yozilish variantlari (comma-separated)
+
+  createdAt DateTime @default(now())
+
+  @@index([name])
+  @@index([region])
+}
+
+// ============================================================
+// MONITOR SESSIONS (Kuzatuv sessionlari — serverda ishlaydi)
+// ============================================================
+
+model MonitorSession {
+  id              String          @id @default(cuid())
+  userId          String
+  user            User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  businessModule  BusinessModule  @default(LOGISTIKA)
+
+  name            String?
+  phone           String
+  sessionString   String?   @db.Text
+  status          MonitorSessionStatus @default(PENDING)
+
+  // Statistika
+  totalGroups     Int       @default(0)
+  messagesRead    Int       @default(0)
+  ordersFound     Int       @default(0)
+  blocksFound     Int       @default(0)
+  lastMessageAt   DateTime?
+
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([userId])
+  @@index([status])
+}
+
+enum MonitorSessionStatus {
+  PENDING
+  CONNECTING
+  ACTIVE
+  INACTIVE
+  BANNED
+  DELETED
+}
+
+// ============================================================
+// ORDERS (Buyurtmalar — kuzatuv sessionlaridan topilgan)
+// ============================================================
+
+model Order {
+  id              String          @id @default(cuid())
+  userId          String
+  user            User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  businessModule  BusinessModule  @default(LOGISTIKA)
+
+  // Xabar ma'lumoti
+  messageText     String      @db.Text
+  groupTitle      String
+  groupTelegramId String
+  senderName      String?
+  senderUsername  String?
+  senderPhone     String?
+  senderTelegramId String?
+  messageDate     DateTime
+
+  // Sender statistikasi
+  senderTodayAds  Int         @default(0)   // Bugun nechta unikal e'lon tarqatgan
+  senderTotalAds  Int         @default(0)   // Jami tarixiy e'lon soni
+
+  // Yuk ma'lumoti (filtrdan olingan)
+  cargoFrom       String?
+  cargoTo         String?
+  cargoType       String?
+  cargoWeight     String?
+  price           String?
+  phone           String?
+  distance        Int?        // km masofa
+
+  // Tur: yuk beruvchi yoki haydovchi
+  type            OrderType   @default(CARGO)
+
+  // Status
+  status          OrderStatus @default(NEW)
+  notes           String?
+
+  // Mashina ma'lumotlari (DRIVER va CARGO uchun)
+  vehicleType     String?
+  vehicleCapacity String?
+
+  // Qaysi monitor session topgan
+  monitorSessionId String?
+
+  // Manba xabar ID si (original e'longa havola uchun)
+  messageId        Int?
+  groupUsername    String?
+
+  // Task 1-2: Import/Export/Ichki klassifikatsiya
+  scope           OrderScope  @default(INTERNAL)
+
+  // Task 10: Qo'lda yaratilgan buyurtmalar
+  isManual        Boolean     @default(false)
+  manualCreatedBy String?
+
+  // Task 10: Sotuvda
+  isForSale       Boolean     @default(false)
+  salePrice       String?
+
+  // Task 13: Qabul qilish
+  acceptedById    String?
+  acceptedAt      DateTime?
+  acceptedStatus  AcceptedOrderStatus?
+
+  // Qo'shimcha yuk (dogʻruz)
+  isAdditionalCargo Boolean   @default(false)
+
+  // Broadcast counter
+  broadcastCount  Int         @default(0)
+
+  // Task 14: Raqam almashish
+  originalPhone   String?
+  swappedPhone    String?
+
+  // Task 15: Yuk yopish
+  closedAmount    Float?
+  closedAt        DateTime?
+  closedById      String?
+
+  // Task 12: Surge narxlash
+  surgeMultiplier Float?      @default(1.0)
+  surgeExpiresAt  DateTime?
+
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  @@index([userId])
+  @@index([status])
+  @@index([type])
+  @@index([createdAt])
+  @@index([monitorSessionId])
+  @@index([senderTelegramId])
+  @@index([phone])
+  @@index([userId, status, createdAt])
+  @@index([userId, type, createdAt])
+  @@index([userId, createdAt])
+  @@index([scope])
+  @@index([acceptedById])
+  @@index([isManual])
+  @@index([cargoFrom, cargoTo])
+}
+
+// Yuk tarqatuvchi bot (@Yukchibor_bot) uchun ruxsat berilgan foydalanuvchilar
+model CargoBotUser {
+  id         String    @id @default(cuid())
+  telegramId String    @unique
+  name       String?
+  chatId     String?
+  isAllowed  Boolean   @default(true)
+  hasStarted Boolean   @default(false)
+  expiresAt  DateTime? // ruxsat tugash vaqti (null = muddatsiz)
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  @@index([isAllowed])
+}
+
+enum BusinessModule {
+  LOGISTIKA
+  TAKSI
+}
+
+enum OrderType {
+  CARGO
+  DRIVER
+}
+
+enum OrderStatus {
+  NEW
+  VIEWED
+  CONTACTED
+  COMPLETED
+  REJECTED
+}
+
+// Task 1-2: Buyurtma ko'lami
+enum OrderScope {
+  INTERNAL
+  IMPORT
+  EXPORT
+}
+
+// Task 13: Qabul qilingan buyurtma statusi
+enum AcceptedOrderStatus {
+  ACCEPTED
+  ON_WAY
+  ARRIVED
+  IN_PROGRESS
+  CLOSED
+  CANCELLED
+  COMPLETED
+}
+
+// ============================================================
 // SETTINGS & CONFIGURATION
 // ============================================================
 
@@ -543,4 +833,915 @@ enum ConfigType {
   NUMBER
   BOOLEAN
   JSON
+}
+
+// ============================================================
+// BLOCKED USERS (Avtomatik bloklash filtr tizimi)
+// ============================================================
+
+model BlockedUser {
+  id                String          @id @default(cuid())
+  userId            String
+  user              User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  businessModule    BusinessModule  @default(LOGISTIKA)
+
+  senderTelegramId  String
+  senderName        String?
+  senderUsername    String?
+  reason            BlockReason
+  ruleNumber        Int
+  messageText       String       @db.Text
+  groupTitle        String
+  groupTelegramId   String
+  phone             String?
+
+  isActive          Boolean      @default(true)
+  unblockedAt       DateTime?
+
+  monitorSessionId  String?
+
+  createdAt         DateTime     @default(now())
+
+  @@index([userId])
+  @@index([senderTelegramId])
+  @@index([reason])
+  @@index([isActive])
+  @@index([createdAt])
+  @@index([phone])
+}
+
+enum BlockReason {
+  DISPATCHER_NAME
+  FEMALE_NAME
+  REPEATED_CHARS
+  FOREIGN_DESTINATION
+  MULTIPLE_MENTIONS
+  LONG_MESSAGE
+  EXCESSIVE_EMOJI
+  EXCESSIVE_NEWLINES
+  USER_MULTI_GROUP
+  USER_SPAM_RATE
+  PHONE_MULTI_GROUP
+  PHONE_SUPER_SPAM
+  FAKE_MULTI_ROUTE
+  MANUAL_BLOCK
+}
+
+// ============================================================
+// DRIVER PROFILES (Haydovchi profillari)
+// ============================================================
+
+model DriverProfile {
+  id                String    @id @default(cuid())
+  userId            String    @unique
+  user              User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Shaxsiy
+  fullName          String?
+  phone             String?
+  passportNumber    String?       // Passport/ID raqam (qochib ketsa topish uchun)
+  birthDate         String?       // Tug'ilgan sana
+  region            String?       // Viloyat
+  district          String?       // Tuman/shahar
+
+  // Mashina — batafsil
+  vehicleType       String?       // Toifa: Yuk mashina, Yengil yuk, Mikroavtobus, Maxsus
+  vehicleBrand      String?       // Marka: HOWO, MAN, Volvo, Kamaz...
+  vehicleModel      String?       // Model: erkin yozish
+  vehicleColor      String?       // Rang
+  vehicleNumber     String?       // Davlat raqami
+  vehicleYear       String?       // Ishlab chiqarilgan yili
+  vehicleCapacity   String?       // Yuk sig'imi (tonna)
+  bodyType          String?       // Kuzov turi: Tentli, Ref, Bortli, Samosval...
+
+  // Hujjatlar
+  licensePhotoUrl       String?
+  vehiclePassportUrl    String?
+
+  // Tasdiqlash
+  isVerified        Boolean   @default(false)
+  verifiedAt        DateTime?
+  verifiedBy        String?
+
+  // GPS + Online
+  isOnline          Boolean   @default(false)
+  lastLat           Float?
+  lastLng           Float?
+  lastLocationAt    DateTime?
+  lastCity          String?
+
+  // Balans
+  balance           Float     @default(0)
+
+  // Obuna
+  subscriptionActive Boolean  @default(false)
+  subscriptionEndDate DateTime?
+
+  // Task 9: Taklif tizimi
+  referralCode      String?   @unique
+  referredById      String?
+
+  // Task 21: Fotokontrol
+  photoVerified     Boolean   @default(false)
+
+  // Login/Parol
+  passwordHash      String?   // bcrypt hash
+
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  offers            DriverOffer[]
+  transactions      DriverTransaction[]
+  vehiclePhotos     VehiclePhoto[]
+  invitesSent       DriverInvite[]  @relation("InviterProfile")
+
+  @@index([isOnline])
+  @@index([isVerified])
+  @@index([lastCity])
+  @@index([referralCode])
+}
+
+// ============================================================
+// DRIVER OFFERS (Haydovchi takliflari)
+// ============================================================
+
+model DriverOffer {
+  id              String       @id @default(cuid())
+  driverId        String
+  driver          User         @relation(fields: [driverId], references: [id])
+  driverProfileId String
+  driverProfile   DriverProfile @relation(fields: [driverProfileId], references: [id])
+  fromCity        String
+  toCity          String
+  vehicleType     String
+  vehicleCapacity String?
+  phone           String
+  description     String?      @db.Text
+  price           String?
+  status          OfferStatus  @default(ACTIVE)
+  expiresAt       DateTime?
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  @@index([status, createdAt])
+  @@index([driverId])
+}
+
+enum OfferStatus {
+  ACTIVE
+  EXPIRED
+  CANCELLED
+  COMPLETED
+}
+
+// ============================================================
+// PRIVATE ORDERS (Maxsus buyurtmalar — admin tomonidan)
+// ============================================================
+
+model PrivateOrder {
+  id              String    @id @default(cuid())
+  createdById     String
+  driverId        String?
+  fromCity        String
+  toCity          String
+  cargoType       String?
+  cargoWeight     String?
+  price           String?
+  phone           String
+  description     String?   @db.Text
+  commissionAmount Float    @default(0)
+  commissionPaid   Boolean  @default(false)
+  status          PrivateOrderStatus @default(PENDING)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([driverId, status])
+  @@index([status])
+  @@index([createdAt])
+}
+
+enum PrivateOrderStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+// ============================================================
+// DRIVER TRANSACTIONS (Haydovchi tranzaksiyalari)
+// ============================================================
+
+model DriverTransaction {
+  id              String    @id @default(cuid())
+  driverProfileId String
+  driverProfile   DriverProfile @relation(fields: [driverProfileId], references: [id])
+  amount          Float
+  type            TransactionType
+  description     String?
+  referenceId     String?
+  createdAt       DateTime  @default(now())
+
+  @@index([driverProfileId, createdAt])
+}
+
+enum TransactionType {
+  TOP_UP
+  COMMISSION
+  REFUND
+  SUBSCRIPTION
+}
+
+// ============================================================
+// PRICE ESTIMATION (Task 11: Narx taxmini)
+// ============================================================
+
+model PriceEstimate {
+  id              String    @id @default(cuid())
+  fromCity        String
+  toCity          String
+  vehicleType     String?
+  avgPrice        Float
+  minPrice        Float
+  maxPrice        Float
+  sampleCount     Int       @default(0)
+  lastCalculated  DateTime  @default(now())
+
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@unique([fromCity, toCity, vehicleType])
+  @@index([fromCity, toCity])
+}
+
+// ============================================================
+// ROUTE DEMAND (Task 12: Yo'nalish talabi / Surge)
+// ============================================================
+
+model RouteDemand {
+  id              String    @id @default(cuid())
+  fromCity        String
+  toCity          String
+  date            DateTime  @db.Date
+  hour            Int?      // 0-23, null = kunlik jami
+  orderCount      Int       @default(0)
+  offerCount      Int       @default(0)
+  surgeMultiplier Float     @default(1.0)
+
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@unique([fromCity, toCity, date, hour])
+  @@index([fromCity, toCity])
+  @@index([date])
+  @@index([surgeMultiplier])
+}
+
+// ============================================================
+// NOTIFICATIONS (Task 16: Push bildirishnomalar)
+// ============================================================
+
+model Notification {
+  id              String              @id @default(cuid())
+  title           String
+  message         String              @db.Text
+  target          NotificationTarget  @default(ALL)
+  sentById        String?             // Admin kim yuborgan
+  isActive        Boolean             @default(true)
+
+  userNotifications UserNotification[]
+
+  createdAt       DateTime            @default(now())
+
+  @@index([target])
+  @@index([createdAt])
+}
+
+enum NotificationTarget {
+  ALL
+  DRIVERS
+  DISPATCHERS
+}
+
+model UserNotification {
+  id              String    @id @default(cuid())
+  userId          String
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  notificationId  String
+  notification    Notification @relation(fields: [notificationId], references: [id], onDelete: Cascade)
+  isRead          Boolean   @default(false)
+  readAt          DateTime?
+
+  createdAt       DateTime  @default(now())
+
+  @@unique([userId, notificationId])
+  @@index([userId, isRead])
+  @@index([notificationId])
+}
+
+// ============================================================
+// CHAT (Task 17: Chat tizimi)
+// ============================================================
+
+model ChatRoom {
+  id              String        @id @default(cuid())
+  name            String?
+  type            ChatRoomType
+  isActive        Boolean       @default(true)
+
+  participants    ChatParticipant[]
+  messages        ChatMessage[]
+
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  @@index([type])
+  @@index([isActive])
+}
+
+enum ChatRoomType {
+  DIRECT
+  DISPATCHER_SUPPORT
+  DRIVER_SUPPORT
+  DISPATCHER_GROUP
+  DRIVER_GROUP
+}
+
+model ChatParticipant {
+  id              String    @id @default(cuid())
+  chatRoomId      String
+  chatRoom        ChatRoom  @relation(fields: [chatRoomId], references: [id], onDelete: Cascade)
+  userId          String
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  isAdmin         Boolean   @default(false)
+  lastReadAt      DateTime?
+
+  createdAt       DateTime  @default(now())
+
+  @@unique([chatRoomId, userId])
+  @@index([userId])
+}
+
+model ChatMessage {
+  id              String    @id @default(cuid())
+  chatRoomId      String
+  chatRoom        ChatRoom  @relation(fields: [chatRoomId], references: [id], onDelete: Cascade)
+  senderId        String
+  sender          User      @relation(fields: [senderId], references: [id], onDelete: Cascade)
+  message         String    @db.Text
+  isEdited        Boolean   @default(false)
+  isDeleted       Boolean   @default(false)
+
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([chatRoomId, createdAt])
+  @@index([senderId])
+}
+
+// ============================================================
+// SUPPORT TICKETS (Task 18: Texpomish)
+// ============================================================
+
+model SupportTicket {
+  id              String              @id @default(cuid())
+  userId          String
+  user            User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subject         String
+  status          SupportTicketStatus @default(OPEN)
+  priority        Int                 @default(0)  // 0=normal, 1=high, 2=urgent
+  assignedTo      String?
+
+  messages        SupportMessage[]
+
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+
+  @@index([userId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+enum SupportTicketStatus {
+  OPEN
+  IN_PROGRESS
+  RESOLVED
+  CLOSED
+}
+
+model SupportMessage {
+  id              String        @id @default(cuid())
+  ticketId        String
+  ticket          SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  senderId        String
+  sender          User          @relation(fields: [senderId], references: [id], onDelete: Cascade)
+  message         String        @db.Text
+  isStaff         Boolean       @default(false) // Admin javobimi
+
+  createdAt       DateTime      @default(now())
+
+  @@index([ticketId, createdAt])
+  @@index([senderId])
+}
+
+// ============================================================
+// BALANCE TRANSACTIONS (Task 19: Yagona balans)
+// ============================================================
+
+model BalanceTransaction {
+  id              String    @id @default(cuid())
+  userId          String
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  amount          Float     // + kirim, - chiqim
+  type            BalanceTransactionType
+  description     String?
+  referenceId     String?   // Bog'liq order/payment ID
+
+  createdAt       DateTime  @default(now())
+
+  @@index([userId, createdAt])
+  @@index([type])
+}
+
+enum BalanceTransactionType {
+  TOP_UP
+  ORDER_PAYMENT
+  COMMISSION
+  REFUND
+  SUBSCRIPTION_PAYMENT
+  BONUS
+}
+
+// ============================================================
+// ACCOUNTING (Buxgalteriya — moliyaviy hisobot)
+// ============================================================
+
+model AccountingCategory {
+  id          String              @id @default(cuid())
+  name        String              // "SMS xarajati", "Obuna daromadi"
+  type        AccountingEntryType // INCOME yoki EXPENSE
+  icon        String?             // AntD icon nomi
+  color       String?             // hex rang (charts uchun)
+  isSystem    Boolean             @default(false)
+  isActive    Boolean             @default(true)
+
+  entries     AccountingEntry[]
+
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+
+  @@unique([name, type])
+  @@index([type])
+}
+
+model AccountingEntry {
+  id            String              @id @default(cuid())
+  type          AccountingEntryType
+  categoryId    String
+  category      AccountingCategory  @relation(fields: [categoryId], references: [id])
+  amount        Float
+  currency      String              @default("UZS")
+  description   String?
+  date          DateTime            // Moliyaviy sana
+
+  // Bog'lanish
+  referenceId   String?             // paymentId, orderId, smsLogId
+  referenceType String?             // PAYMENT, ORDER, SMS, SUBSCRIPTION, MANUAL
+
+  // Kim yozgan
+  createdById   String
+  createdBy     User                @relation("AccountingEntries", fields: [createdById], references: [id])
+
+  createdAt     DateTime            @default(now())
+  updatedAt     DateTime            @updatedAt
+
+  @@index([type, date])
+  @@index([categoryId])
+  @@index([date])
+  @@index([referenceType, referenceId])
+}
+
+enum AccountingEntryType {
+  INCOME
+  EXPENSE
+}
+
+// ============================================================
+// SMS LOG (Task 20: SMS integratsiya)
+// ============================================================
+
+model SmsLog {
+  id              String      @id @default(cuid())
+  phone           String
+  message         String      @db.Text
+  status          SmsStatus   @default(PENDING)
+  category        SmsCategory @default(GENERAL)
+  provider        String      @default("semysms")
+  errorMessage    String?
+  sentById        String?     // Kim yuborgan
+  targetName      String?     // Kimga yuborildi (ism, order info)
+  externalId      String?     // SemySMS response ID
+
+  // Retry — qurilma offline bo'lganda qayta urinish
+  retryCount      Int         @default(0)
+  nextRetryAt     DateTime?   // Qachon qayta yuborish kerak
+  retryable       Boolean     @default(false) // Xato retryable bo'lsa true
+
+  createdAt       DateTime    @default(now())
+
+  @@index([phone])
+  @@index([status])
+  @@index([category])
+  @@index([createdAt])
+  @@index([retryable, nextRetryAt])
+}
+
+enum SmsStatus {
+  PENDING
+  SENT
+  DELIVERED
+  FAILED
+}
+
+enum SmsCategory {
+  GENERAL
+  DRIVER
+  ORDER
+  BLOCKED_AD
+}
+
+// ============================================================
+// VEHICLE PHOTOS (Task 21: Fotokontrol)
+// ============================================================
+
+model VehiclePhoto {
+  id              String         @id @default(cuid())
+  driverProfileId String
+  driverProfile   DriverProfile  @relation(fields: [driverProfileId], references: [id], onDelete: Cascade)
+  type            VehiclePhotoType
+  url             String
+  isApproved      Boolean        @default(false)
+  approvedBy      String?
+  approvedAt      DateTime?
+  rejectionReason String?
+
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  @@unique([driverProfileId, type])
+  @@index([isApproved])
+}
+
+enum VehiclePhotoType {
+  INTERIOR
+  FRONT
+  BACK
+  LEFT
+  RIGHT
+}
+
+// ============================================================
+// RATING (Haydovchi ↔ Dispetcher reyting)
+// ============================================================
+
+model UserRating {
+  id            String   @id @default(cuid())
+  fromUserId    String   // Kim baholadi
+  toUserId      String   // Kimni baholaydi
+  fromUser      User     @relation("RatingsGiven", fields: [fromUserId], references: [id])
+  toUser        User     @relation("RatingsReceived", fields: [toUserId], references: [id])
+  score         Int      // 1-5 yulduz
+  comment       String?  @db.Text
+  orderId       String?  // Qaysi buyurtma bo'yicha
+  createdAt     DateTime @default(now())
+
+  @@unique([fromUserId, toUserId, orderId])
+  @@index([toUserId])
+  @@index([fromUserId])
+}
+
+// ============================================================
+// TELEGRAM DISPATCHER ADS (Bloklangan senderlar e'lonlari)
+// Max 10K, cron tozalaydi
+// ============================================================
+
+model TelegramDispatcherAd {
+  id              String   @id @default(cuid())
+  messageText     String   @db.Text
+  cargoFrom       String?
+  cargoTo         String?
+  vehicleType     String?
+  vehicleCapacity String?
+  phone           String?
+  senderName      String?
+  senderTelegramId String?
+  groupTitle      String?
+  groupTelegramId  String?
+  scope           String?  // INTERNAL, IMPORT, EXPORT
+  createdAt       DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([cargoFrom])
+  @@index([scope])
+}
+
+// ============================================================
+// DRIVER INVITES (Task 9: Haydovchi taklif tizimi)
+// ============================================================
+
+model DriverInvite {
+  id              String    @id @default(cuid())
+  inviterProfileId String
+  inviterProfile  DriverProfile @relation("InviterProfile", fields: [inviterProfileId], references: [id], onDelete: Cascade)
+  invitedUserId   String?
+  invitedPhone    String?
+  code            String    @unique
+  isUsed          Boolean   @default(false)
+  usedAt          DateTime?
+  rewardGiven     Boolean   @default(false)
+  rewardAmount    Float     @default(0)
+
+  createdAt       DateTime  @default(now())
+
+  @@index([inviterProfileId])
+  @@index([code])
+  @@index([isUsed])
+}
+
+// ============================================================
+// TELEGRAM SMS (Telegram orqali xabar yuborish tizimi)
+// ============================================================
+
+model TelegramSmsSession {
+  id              String              @id @default(cuid())
+  phone           String              @unique
+  name            String?
+  sessionString   String?             @db.Text
+  status          TgSmsSessionStatus  @default(PENDING)
+
+  // Stats
+  messagesSent    Int                 @default(0)
+  messagesFailed  Int                 @default(0)
+  lastUsedAt      DateTime?
+  lastErrorAt     DateTime?
+  lastError       String?
+
+  // Spam/Freeze
+  spamDetectedAt  DateTime?
+  spamType        String?             // SPAM, FROZEN, FLOOD
+  spamExpectedEnd DateTime?
+
+  // Enabled for sending
+  isEnabled       Boolean             @default(true)
+
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+
+  messages        TelegramSmsMessage[]
+
+  @@index([status])
+  @@index([isEnabled])
+}
+
+enum TgSmsSessionStatus {
+  PENDING
+  CONNECTING
+  ACTIVE
+  SPAM
+  FROZEN
+  BANNED
+  DISCONNECTED
+}
+
+model TelegramSmsMessage {
+  id                String          @id @default(cuid())
+  sessionId         String?
+  session           TelegramSmsSession? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+
+  targetTelegramId  String?
+  targetPhone       String?
+  targetName        String?
+  message           String          @db.Text
+
+  status            TgSmsMessageStatus @default(PENDING)
+
+  // Delivery
+  telegramMsgId     Int?
+  deliveredAt       DateTime?
+  readAt            DateTime?
+  errorMessage      String?
+
+  // Category
+  category          String?         // DRIVER, ORDER, BLOCKED, GENERAL
+  referenceId       String?         // orderId, driverId, etc.
+
+  sentById          String?         // admin/dispatcher who initiated
+
+  createdAt         DateTime        @default(now())
+
+  @@index([status])
+  @@index([category])
+  @@index([targetTelegramId])
+  @@index([createdAt])
+  @@index([sessionId])
+}
+
+enum TgSmsMessageStatus {
+  PENDING
+  SENT
+  DELIVERED
+  READ
+  FAILED
+  SPAM_BLOCKED
+}
+
+// ============================================================
+// ROLE PERMISSIONS (Task 24: Rollar boshqaruvi)
+// ============================================================
+
+model RolePermission {
+  id              String          @id @default(cuid())
+  role            UserRole
+  section         String          // orders, drivers, analytics, settings, etc.
+  action          PermissionAction
+
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  @@unique([role, section, action])
+  @@index([role])
+  @@index([section])
+}
+
+enum PermissionAction {
+  VIEW
+  CREATE
+  EDIT
+  DELETE
+  EXPORT
+  MANAGE
+}
+
+// ============================================================
+// YO'LDA DISPATCHER (alohida call-center app uchun)
+// Mavjud modullarga ta'sir qilmaydi — faqat User'ga userId orqali bog'lanadi
+// ============================================================
+
+model YoldaDispatcher {
+  id              String              @id @default(cuid())
+  userId          String              @unique
+  phone           String?             // dispetcher ishchi raqami
+  fullName        String?
+  workMode        YoldaDispatcherMode @default(GEOFENCED)
+  isActive        Boolean             @default(true)
+  lastSeenAt      DateTime?
+  lastLat         Float?
+  lastLng         Float?
+  currentZoneId   String?             // hozir qaysi zonada
+  deviceInfo      Json?               // telefon turi, Android versiyasi, recording qobiliyati
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+
+  // Relations (yangi — mavjud kod'ga ta'sirsiz)
+  calls           YoldaCallLog[]
+  driverRequests  YoldaDriverRequest[]
+  zones           YoldaGeoZoneAssignment[]
+
+  @@index([isActive])
+  @@index([userId])
+}
+
+enum YoldaDispatcherMode {
+  GEOFENCED  // faqat tayinlangan zonalarda ishlaydi
+  ANYWHERE   // har joyda ishlaydi
+}
+
+model YoldaGeoZone {
+  id              String              @id @default(cuid())
+  name            String
+  type            YoldaGeoZoneType    @default(POLYGON)
+  coordinates     Json                // POLYGON: [[lng,lat],...] | CIRCLE: {lat,lng,radiusM}
+  centerLat       Float               // tez qidiruv uchun
+  centerLng       Float
+  radiusMeters    Int?                // CIRCLE uchun
+  color           String?             @default("#6B46C1")
+  isActive        Boolean             @default(true)
+  isGlobal        Boolean             @default(false) // true = barcha dispetcherlar
+  description     String?
+  createdById     String              // User.id (admin)
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+
+  assignments     YoldaGeoZoneAssignment[]
+
+  @@index([isActive])
+  @@index([isGlobal])
+}
+
+enum YoldaGeoZoneType {
+  POLYGON
+  CIRCLE
+}
+
+// Many-to-many: dispetcher ↔ geozone
+model YoldaGeoZoneAssignment {
+  id            String          @id @default(cuid())
+  dispatcherId  String
+  zoneId        String
+  dispatcher    YoldaDispatcher @relation(fields: [dispatcherId], references: [id], onDelete: Cascade)
+  zone          YoldaGeoZone    @relation(fields: [zoneId], references: [id], onDelete: Cascade)
+  createdAt     DateTime        @default(now())
+
+  @@unique([dispatcherId, zoneId])
+  @@index([dispatcherId])
+  @@index([zoneId])
+}
+
+model YoldaCallLog {
+  id                String              @id @default(cuid())
+  dispatcherId      String
+  phone             String
+  direction         YoldaCallDirection
+  startedAt         DateTime            @default(now())
+  endedAt           DateTime?
+  durationSec       Int?
+
+  // Tasnif — popup'da tanlangan
+  vehicleType       String?             // FURA, KAMAZ, ISUZU, GAZEL, LABO, DAMAS ...
+  vehicleCapacity   String?             // "20 tonna", "3 kub" kabi
+  senderRole        YoldaSenderRole?
+
+  // Geo
+  lat               Float?
+  lng               Float?
+  zoneId            String?             // qaysi zonada edi
+
+  // Telegram voice
+  telegramMsgId     String?             // guruhga yuborilgan voice msg ID
+  telegramGroupId   String?             // qaysi guruhga yuborildi
+  voiceSent         Boolean             @default(false)
+  voiceSentAt       DateTime?
+  voiceError        String?             // yuborish xatosi
+
+  // Kontekst
+  relatedOrderId    String?             // agar e'londan keyin qilingan bo'lsa
+  notes             String?
+
+  createdAt         DateTime            @default(now())
+  updatedAt         DateTime            @updatedAt
+
+  dispatcher        YoldaDispatcher     @relation(fields: [dispatcherId], references: [id], onDelete: Cascade)
+
+  @@index([phone])
+  @@index([dispatcherId, startedAt(sort: Desc)])
+  @@index([vehicleType])
+  @@index([senderRole])
+}
+
+enum YoldaCallDirection {
+  INBOUND
+  OUTBOUND
+}
+
+enum YoldaSenderRole {
+  CARGO_OWNER   // yukchi (yuk sohibi)
+  DRIVER        // haydovchi
+  UNKNOWN
+  SPAM          // kerak emas, shovqin
+}
+
+model YoldaCallBlocklist {
+  id          String      @id @default(cuid())
+  phone       String      @unique
+  reason      String?
+  addedById   String      // User.id (admin)
+  createdAt   DateTime    @default(now())
+
+  @@index([phone])
+}
+
+model YoldaDriverRequest {
+  id              String                      @id @default(cuid())
+  dispatcherId    String
+  orderId         String?                     // Order ID (ixtiyoriy)
+  orderSnapshot   Json?                       // order snapshot (delete'dan keyin ham qoladi)
+  requestedPhone  String?                     // dispetcher topilishini so'ragan raqam
+  status          YoldaDriverRequestStatus    @default(PENDING)
+  adminNote       String?
+  resolvedById    String?                     // qaysi admin javob berdi
+  resolvedAt      DateTime?
+  createdAt       DateTime                    @default(now())
+
+  dispatcher      YoldaDispatcher             @relation(fields: [dispatcherId], references: [id], onDelete: Cascade)
+
+  @@index([status])
+  @@index([dispatcherId])
+}
+
+enum YoldaDriverRequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  EXPIRED
 }

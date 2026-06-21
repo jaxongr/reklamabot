@@ -3,12 +3,137 @@ import { PrismaService } from '../common/prisma.service';
 import { User, UserRole, UserStatus, Prisma } from '@prisma/client';
 import { CreateUserDto } from './dto/create-user.dto';
 import { UpdateUserDto } from './dto/update-user.dto';
+import * as crypto from 'crypto';
 
 @Injectable()
 export class UsersService {
   private readonly logger = new Logger(UsersService.name);
 
+  // GPS shahar topish uchun cache (10 daqiqa)
+  private cachedCities: Array<{ name: string; lat: number; lng: number }> | null = null;
+  private cachedCitiesAt = 0;
+
   constructor(private readonly prisma: PrismaService) {}
+
+  // ============================================================
+  // GPS LOCATION (har qanday autentifikatsiya qilingan user uchun)
+  // ============================================================
+
+  private async getCachedCities() {
+    const now = Date.now();
+    if (this.cachedCities && now - this.cachedCitiesAt < 10 * 60_000) {
+      return this.cachedCities;
+    }
+    const locations = await this.prisma.location.findMany({
+      where: { type: 'CITY', lat: { not: null }, lng: { not: null } },
+      select: { name: true, lat: true, lng: true },
+    });
+    this.cachedCities = locations.filter(
+      (l) => l.lat != null && l.lng != null,
+    ) as Array<{ name: string; lat: number; lng: number }>;
+    this.cachedCitiesAt = now;
+    return this.cachedCities;
+  }
+
+  private haversineDistance(lat1: number, lon1: number, lat2: number, lon2: number): number {
+    const R = 6371; // km
+    const toRad = (deg: number) => deg * (Math.PI / 180);
+    const dLat = toRad(lat2 - lat1);
+    const dLon = toRad(lon2 - lon1);
+    const a =
+      Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+      Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+        Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return R * c;
+  }
+
+  /**
+   * Online ping — foydalanuvchini onlayn deb belgilash + lastOnlineAt yangilash.
+   * Mobile foreground service har 10 sekundda chaqiradi.
+   */
+  async markOnline(userId: string) {
+    return this.prisma.user.update({
+      where: { id: userId },
+      data: {
+        isOnline: true,
+        lastOnlineAt: new Date(),
+      },
+      select: { id: true, isOnline: true, lastOnlineAt: true },
+    });
+  }
+
+  /**
+   * Foydalanuvchi joylashuvini yangilash (har qanday autentifikatsiya qilingan rol)
+   */
+  async updateMyLocation(userId: string, lat: number, lng: number) {
+    // Eng yaqin shahar topish
+    let lastCity: string | null = null;
+    try {
+      const cities = await this.getCachedCities();
+      let minDist = Infinity;
+      for (const loc of cities) {
+        const dist = this.haversineDistance(lat, lng, loc.lat, loc.lng);
+        if (dist < minDist) {
+          minDist = dist;
+          lastCity = loc.name;
+        }
+      }
+    } catch (e: any) {
+      this.logger.warn(`Shahar topishda xatolik: ${e?.message || e}`);
+    }
+
+    return this.prisma.user.update({
+      where: { id: userId },
+      data: {
+        lastLat: lat,
+        lastLng: lng,
+        lastLocationAt: new Date(),
+        lastCity,
+      },
+      select: {
+        id: true,
+        lastLat: true,
+        lastLng: true,
+        lastLocationAt: true,
+        lastCity: true,
+      },
+    });
+  }
+
+  /**
+   * Online dispetcherlar — admin xaritasi uchun
+   * Filter: role=DISPATCHER, lastLocationAt oxirgi 5 daqiqada
+   */
+  async getOnlineDispatchers(thresholdMinutes = 5) {
+    const since = new Date(Date.now() - thresholdMinutes * 60_000);
+
+    return this.prisma.user.findMany({
+      where: {
+        role: UserRole.DISPATCHER,
+        isActive: true,
+        lastLocationAt: { gte: since },
+        lastLat: { not: null },
+        lastLng: { not: null },
+      },
+      select: {
+        id: true,
+        firstName: true,
+        lastName: true,
+        username: true,
+        phoneNumber: true,
+        lastLat: true,
+        lastLng: true,
+        lastCity: true,
+        lastLocationAt: true,
+        isOnline: true,
+        isLineActive: true,
+        role: true,
+      },
+      orderBy: { lastLocationAt: 'desc' },
+      take: 1000,
+    });
+  }
 
   /**
    * Create a new user
@@ -49,6 +174,21 @@ export class UsersService {
         orderBy: orderBy || { createdAt: 'desc' },
         include: {
           subscription: true,
+          sessions: {
+            where: { status: { not: 'DELETED' } },
+            select: {
+              id: true,
+              name: true,
+              phone: true,
+              status: true,
+              isFrozen: true,
+              totalGroups: true,
+              activeGroups: true,
+              lastSyncAt: true,
+              createdAt: true,
+            },
+            orderBy: { createdAt: 'desc' },
+          },
           _count: {
             select: {
               ads: true,
@@ -228,6 +368,7 @@ export class UsersService {
         role: user.role,
         status: user.status,
         isActive: user.isActive,
+        isLineActive: user.isLineActive,
         brandAdText: user.brandAdText,
         brandAdEnabled: user.brandAdEnabled,
         createdAt: user.createdAt,
@@ -304,11 +445,17 @@ export class UsersService {
   /**
    * Toggle user active status
    */
-  async toggleActive(id: string): Promise<User> {
+  async toggleActive(id: string, reason?: string): Promise<User> {
     const user = await this.findOne(id);
-    return this.update(id, {
-      isActive: !user.isActive,
-      status: !user.isActive ? UserStatus.ACTIVE : UserStatus.SUSPENDED,
+    const newActive = !user.isActive;
+    return this.prisma.user.update({
+      where: { id },
+      data: {
+        isActive: newActive,
+        status: newActive ? UserStatus.ACTIVE : UserStatus.SUSPENDED,
+        blockReason: newActive ? null : (reason || 'Admin tomonidan bloklangan'),
+        blockedAt: newActive ? null : new Date(),
+      },
     });
   }
 
@@ -393,5 +540,138 @@ export class UsersService {
       usersByRole,
       usersWithSubscription,
     };
+  }
+
+  /**
+   * Linya holatini o'zgartirish
+   */
+  async setLineStatus(userId: string, isLineActive: boolean) {
+    const user = await this.prisma.user.update({
+      where: { id: userId },
+      data: { isLineActive },
+      select: { id: true, isLineActive: true },
+    });
+    this.logger.log(`Linya ${isLineActive ? 'yoqildi' : "o'chirildi"}: userId=${userId}`);
+    return user;
+  }
+
+  // ============================================================
+  // Task 14: E'lon uchun telefon raqamlar
+  // ============================================================
+
+  async getAdPhones(userId: string) {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { adPhoneNumbers: true },
+    });
+    return user?.adPhoneNumbers || [];
+  }
+
+  async updateAdPhones(userId: string, phones: string[]) {
+    return this.prisma.user.update({
+      where: { id: userId },
+      data: { adPhoneNumbers: phones },
+      select: { adPhoneNumbers: true },
+    });
+  }
+
+  // ===================== HODIMLAR BOSHQARUVI =====================
+
+  /**
+   * Yangi hodim yaratish (username + password + role)
+   */
+  async createStaff(data: {
+    username: string;
+    password: string;
+    firstName: string;
+    lastName?: string;
+    role: UserRole;
+    phoneNumber?: string;
+  }) {
+    // Username tekshirish
+    const existing = await this.prisma.user.findFirst({
+      where: { username: { equals: data.username, mode: 'insensitive' } },
+    });
+    if (existing) {
+      throw new BadRequestException('Bu username allaqachon mavjud');
+    }
+
+    const passwordHash = crypto.createHash('sha256').update(data.password).digest('hex');
+    const telegramId = `staff_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+    return this.prisma.user.create({
+      data: {
+        telegramId,
+        username: data.username,
+        firstName: data.firstName,
+        lastName: data.lastName,
+        phoneNumber: data.phoneNumber,
+        role: data.role,
+        status: 'ACTIVE',
+        isActive: true,
+        brandAdText: passwordHash,
+      },
+    });
+  }
+
+  /**
+   * Hodim parolini o'zgartirish
+   */
+  async changePassword(userId: string, newPassword: string) {
+    const passwordHash = crypto.createHash('sha256').update(newPassword).digest('hex');
+    return this.prisma.user.update({
+      where: { id: userId },
+      data: { brandAdText: passwordHash },
+      select: { id: true, username: true },
+    });
+  }
+
+  /**
+   * Barcha hodimlar ro'yxati (ADMIN, SUPER_ADMIN, DISPATCHER)
+   */
+  async getStaffList() {
+    return this.prisma.user.findMany({
+      where: {
+        OR: [
+          { telegramId: { startsWith: 'staff_' } },
+          { role: { in: ['ADMIN', 'SUPER_ADMIN'] } },
+        ],
+      },
+      select: {
+        id: true,
+        username: true,
+        firstName: true,
+        lastName: true,
+        phoneNumber: true,
+        role: true,
+        status: true,
+        isActive: true,
+        createdAt: true,
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+  }
+
+  async findByIds(ids: string[]) {
+    return this.prisma.user.findMany({
+      where: { id: { in: ids } },
+      select: {
+        id: true, firstName: true, lastName: true,
+        phoneNumber: true, role: true, lastOnlineAt: true,
+      },
+    });
+  }
+
+  async findAllWithOnlineStatus(where: any) {
+    return this.prisma.user.findMany({
+      where,
+      select: {
+        id: true, firstName: true, lastName: true,
+        phoneNumber: true, role: true, isOnline: true, lastOnlineAt: true,
+        fcmToken: true, createdAt: true,
+      },
+      orderBy: [{ isOnline: 'desc' }, { lastOnlineAt: 'desc' }],
+      take: 500,
+    });
   }
 }

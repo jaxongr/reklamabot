@@ -11,7 +11,7 @@ const api = axios.create({
   },
 })
 
-// Request interceptor
+// Request interceptor — faqat JWT token
 api.interceptors.request.use(
   (config) => {
     const token = localStorage.getItem('token')

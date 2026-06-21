@@ -9,6 +9,7 @@ import {
   UseGuards,
   Request,
   Query,
+  BadRequestException,
 } from '@nestjs/common';
 import { SessionsService } from './sessions.service';
 import { TelegramService } from '../telegram/telegram.service';
@@ -16,6 +17,7 @@ import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { SessionStatus } from '@prisma/client';
 import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
+import { Public } from '../auth/decorators/public.decorator';
 
 @ApiTags('Sessions')
 @ApiBearerAuth()
@@ -72,6 +74,45 @@ export class SessionsController {
     });
   }
 
+  // ============================================================
+  // SESSION AUTH (Telegram auth flow)
+  // ============================================================
+
+  @Post('send-code')
+  @ApiOperation({ summary: 'Send Telegram auth code for new session' })
+  async sendCode(
+    @Request() req: any,
+    @Body() body: { phone: string; name?: string },
+  ) {
+    return this.telegramService.sendCode(req.user.userId, body.phone, body.name);
+  }
+
+  @Post(':id/sign-in')
+  @ApiOperation({ summary: 'Sign in to Telegram session with code/password' })
+  async signIn(
+    @Param('id') id: string,
+    @Body() body: { code?: string; password?: string },
+  ) {
+    try {
+      return await this.telegramService.signIn(id, body.code || '', body.password);
+    } catch (error: any) {
+      const msg = error?.message || String(error);
+      // 2FA parol kerak — maxsus response qaytarish
+      if (msg.includes('2FA_REQUIRED') || msg.includes('SESSION_PASSWORD_NEEDED')) {
+        return { error: '2FA_REQUIRED', message: 'Ikki bosqichli parol kerak' };
+      }
+      // Kod xatolari — foydalanuvchiga tushunarli
+      if (msg.includes('PHONE_CODE_INVALID') || msg.includes('noto\'g\'ri')) {
+        return { error: 'CODE_INVALID', message: 'Kod noto\'g\'ri. Qayta tekshiring.' };
+      }
+      if (msg.includes('PHONE_CODE_EXPIRED') || msg.includes('RESEND_CODE') || msg.includes('muddati')) {
+        return { error: 'CODE_EXPIRED', message: 'Kod muddati o\'tgan. Yangi kod yuborildi.' };
+      }
+      // Boshqa xato
+      return { error: 'UNKNOWN', message: msg.length > 100 ? msg.substring(0, 100) : msg };
+    }
+  }
+
   @Patch(':id')
   @ApiOperation({ summary: 'Update session' })
   async update(
@@ -91,12 +132,40 @@ export class SessionsController {
     return this.sessionsService.remove(id);
   }
 
+  @Public()
+  @Post(':id/sync')
+  @ApiOperation({ summary: 'Sync session groups from Telegram' })
+  async syncGroups(@Param('id') id: string) {
+    // Muzlatilgan sessionni sync qilmaslik
+    const session = await this.sessionsService.findOne(id);
+    if (session.isFrozen) {
+      throw new BadRequestException('Sessiya muzlatilgan. Avval eritib oling.');
+    }
+
+    // Avval sessionni ulash
+    if (!this.telegramService.isClientConnected(id)) {
+      await this.telegramService.connectSession(id);
+    }
+    const count = await this.telegramService.syncGroups(id);
+    return { success: true, totalGroups: count };
+  }
+
   @Post(':id/freeze')
   @ApiOperation({ summary: 'Freeze session' })
   async freeze(
     @Param('id') id: string,
     @Body() body: { unfreezeAt?: string },
   ) {
+    // Avval Telegram clientni uzish (worker dan)
+    try {
+      if (this.telegramService.isClientConnected(id)) {
+        await this.telegramService.disconnectSession(id);
+      }
+    } catch (e) {
+      // Disconnect xatosi freeze ni to'xtatmasin
+    }
+
+    // DB da muzlatish
     return this.sessionsService.markFrozen(
       id,
       body.unfreezeAt ? new Date(body.unfreezeAt) : undefined,

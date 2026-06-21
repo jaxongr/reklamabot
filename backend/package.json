@@ -17,7 +17,8 @@
     "test:watch": "jest --watch",
     "test:cov": "jest --coverage",
     "test:debug": "node --inspect-brk -r tsconfig-paths/register -r ts-node/register node_modules/.bin/jest --runInBand",
-    "test:e2e": "jest --config ./test/jest-e2e.json"
+    "test:e2e": "jest --config ./test/jest-e2e.json",
+    "postinstall": "node scripts/patch-gramjs.js"
   },
   "dependencies": {
     "@nestjs/common": "^11.0.1",
@@ -32,13 +33,17 @@
     "@nestjs/throttler": "^6.5.0",
     "@nestjs/websockets": "^11.1.13",
     "@prisma/client": "^5.22.0",
+    "@types/bcrypt": "^6.0.0",
+    "@types/node-telegram-bot-api": "^0.64.14",
     "bcrypt": "^6.0.0",
     "bull": "^4.16.5",
     "class-transformer": "^0.5.1",
     "class-validator": "^0.14.3",
+    "firebase-admin": "^13.7.0",
     "input": "^1.0.1",
     "ioredis": "^5.9.3",
     "multer": "^2.0.2",
+    "node-telegram-bot-api": "^0.67.0",
     "passport": "^0.7.0",
     "passport-jwt": "^4.0.1",
     "prisma": "^5.22.0",

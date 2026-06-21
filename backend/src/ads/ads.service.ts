@@ -4,12 +4,12 @@ import { TelegramService } from '../telegram/telegram.service';
 import { Ad, AdStatus, Prisma, MediaType } from '@prisma/client';
 
 interface CreateAdDto {
-  title: string;
+  title?: string;
   description?: string;
-  content: string;
-  mediaUrls: string[];
-  mediaType: MediaType;
-  price?: number;
+  content?: string;
+  mediaUrls?: string[];
+  mediaType?: MediaType;
+  price?: number | string;
   currency?: string;
   totalQuantity?: number;
   brandAdEnabled?: boolean;
@@ -19,6 +19,11 @@ interface CreateAdDto {
   intervalMax?: number;
   groupInterval?: number;
   isPriority?: boolean;
+  cargoFrom?: string;
+  cargoTo?: string;
+  cargoWeight?: string;
+  vehicleType?: string;
+  status?: string;
 }
 
 interface UpdateAdDto {
@@ -56,10 +61,28 @@ export class AdsService {
     try {
       const ad = await this.prisma.ad.create({
         data: {
-          ...data,
           userId,
           createdBy: userId,
-          status: AdStatus.DRAFT,
+          title: data.title || '',
+          description: data.description,
+          content: data.content || data.title || '',
+          mediaUrls: data.mediaUrls || [],
+          mediaType: data.mediaType,
+          price: data.price != null ? Number(data.price) || 0 : undefined,
+          currency: data.currency,
+          totalQuantity: data.totalQuantity,
+          brandAdEnabled: data.brandAdEnabled,
+          brandAdText: data.brandAdText,
+          selectedGroups: data.selectedGroups || [],
+          intervalMin: data.intervalMin,
+          intervalMax: data.intervalMax,
+          groupInterval: data.groupInterval,
+          isPriority: data.isPriority,
+          cargoFrom: data.cargoFrom,
+          cargoTo: data.cargoTo,
+          cargoWeight: data.cargoWeight ? Number(data.cargoWeight) || 0 : undefined,
+          vehicleType: data.vehicleType,
+          status: (data.status as AdStatus) || AdStatus.DRAFT,
         },
       });
 
@@ -249,30 +272,47 @@ export class AdsService {
   /**
    * Close ad (mark as sold) + guruhlardan xabarlarni o'chirish
    */
-  async close(id: string, userId: string, soldQuantity: number, closedBy: string, reason?: string): Promise<Ad> {
+  async close(id: string, userId: string, data: {
+    soldQuantity: number;
+    reason?: string;
+    closedAmount?: number;
+    cargoFrom?: string;
+    cargoTo?: string;
+    cargoType?: string;
+    cargoWeight?: number;
+    vehicleType?: string;
+    distance?: number;
+  }): Promise<Ad> {
     const ad = await this.findOne(id);
     if (ad.userId !== userId && ad.createdBy !== userId) {
       throw new Error('You can only close your own ads');
     }
 
-    if (ad.status !== AdStatus.ACTIVE) {
-      throw new Error('Ad is not active');
+    // ACTIVE, DRAFT, PAUSED holatdagi e'lonlarni yopish mumkin
+    if (![AdStatus.ACTIVE, AdStatus.DRAFT, AdStatus.PAUSED].includes(ad.status as any)) {
+      throw new Error('Bu e\'lonni yopib bo\'lmaydi');
     }
 
     const updatedAd = await this.prisma.ad.update({
       where: { id },
       data: {
         status: AdStatus.CLOSED,
-        soldQuantity,
+        soldQuantity: data.soldQuantity,
         isSold: true,
         soldAt: new Date(),
-        closedBy,
-        closedReason: reason,
-        title: `${ad.title} ✅ (SOTILDI: ${soldQuantity})`,
+        closedBy: userId,
+        closedReason: data.reason,
+        closedAmount: data.closedAmount,
+        cargoFrom: data.cargoFrom,
+        cargoTo: data.cargoTo,
+        cargoType: data.cargoType,
+        cargoWeight: data.cargoWeight,
+        vehicleType: data.vehicleType,
+        distance: data.distance,
       },
     });
 
-    this.logger.log(`Ad closed: ${id}, sold: ${soldQuantity}`);
+    this.logger.log(`Ad closed: ${id}, sold: ${data.soldQuantity}`);
 
     // Background da xabarlarni guruhlardan o'chirish (foydalanuvchi kutmasin)
     this.deleteAdMessagesInBackground(id).catch(err =>
@@ -509,6 +549,124 @@ export class AdsService {
   }
 
   /**
+   * Dashboard dan qo'lda yopilgan yuk kiritish
+   */
+  async createManualClosed(userId: string, data: {
+    content?: string;
+    closedAmount?: number;
+    cargoFrom?: string;
+    cargoTo?: string;
+    cargoType?: string;
+    cargoWeight?: number;
+    vehicleType?: string;
+    distance?: number;
+    soldAt?: string;
+  }): Promise<Ad> {
+    const title = data.cargoFrom && data.cargoTo
+      ? `${data.cargoFrom} → ${data.cargoTo}`
+      : 'Qo\'lda kiritilgan yuk';
+
+    const ad = await this.prisma.ad.create({
+      data: {
+        userId,
+        createdBy: userId,
+        title,
+        content: data.content || title,
+        mediaType: 'TEXT',
+        status: AdStatus.CLOSED,
+        isSold: true,
+        soldAt: data.soldAt ? new Date(data.soldAt) : new Date(),
+        soldQuantity: 1,
+        closedBy: userId,
+        closedAmount: data.closedAmount,
+        cargoFrom: data.cargoFrom,
+        cargoTo: data.cargoTo,
+        cargoType: data.cargoType,
+        cargoWeight: data.cargoWeight,
+        vehicleType: data.vehicleType,
+        distance: data.distance,
+        isManualEntry: true,
+      },
+    });
+
+    this.logger.log(`Manual closed deal created: ${ad.id}`);
+    return ad;
+  }
+
+  /**
+   * Yopilgan yuklar ro'yxati (barcha yoki userId bo'yicha)
+   */
+  async findClosed(params?: {
+    userId?: string;
+    skip?: number;
+    take?: number;
+    search?: string;
+    cargoType?: string;
+    startDate?: string;
+    endDate?: string;
+  }) {
+    // Faqat deal recordlarni ko'rsatish (closedAmount bor = deal, yo'q = asl e'lon)
+    const where: Prisma.AdWhereInput = {
+      status: AdStatus.CLOSED,
+      closedAmount: { not: null },
+    };
+
+    if (params?.userId) {
+      where.userId = params.userId;
+    }
+
+    if (params?.search) {
+      where.OR = [
+        { title: { contains: params.search, mode: 'insensitive' } },
+        { content: { contains: params.search, mode: 'insensitive' } },
+        { cargoFrom: { contains: params.search, mode: 'insensitive' } },
+        { cargoTo: { contains: params.search, mode: 'insensitive' } },
+      ];
+    }
+
+    if (params?.cargoType) {
+      where.cargoType = { contains: params.cargoType, mode: 'insensitive' };
+    }
+
+    if (params?.startDate || params?.endDate) {
+      where.soldAt = {};
+      if (params.startDate) (where.soldAt as any).gte = new Date(params.startDate);
+      if (params.endDate) (where.soldAt as any).lte = new Date(params.endDate);
+    }
+
+    const { skip = 0, take = 50 } = params || {};
+
+    const [ads, total, aggregate] = await Promise.all([
+      this.prisma.ad.findMany({
+        where,
+        skip,
+        take,
+        orderBy: { soldAt: 'desc' },
+        include: { user: { select: { firstName: true, username: true, telegramId: true } } },
+      }),
+      this.prisma.ad.count({ where }),
+      this.prisma.ad.aggregate({
+        where,
+        _sum: { closedAmount: true, cargoWeight: true },
+        _avg: { closedAmount: true, cargoWeight: true },
+        _count: true,
+      }),
+    ]);
+
+    return {
+      data: ads,
+      meta: { total, skip, take, hasMore: skip + take < total },
+      stats: {
+        totalDeals: aggregate._count,
+        totalAmount: aggregate._sum.closedAmount || 0,
+        totalWeight: aggregate._sum.cargoWeight || 0,
+        avgAmount: aggregate._avg.closedAmount || 0,
+        avgWeight: aggregate._avg.cargoWeight || 0,
+      },
+    };
+  }
+
+  /**
    * Get dashboard stats for user
    */
   async getDashboardStats(userId: string) {
@@ -521,6 +679,9 @@ export class AdsService {
 
     const priceAnalytics = await this.getPriceAnalytics(userId);
 
+    // Oxirgi 7 kunlik e'lon faolligi trendi (grafik uchun real ma'lumot)
+    const { trend, growthPercent } = await this.getAdTrend(userId);
+
     return {
       user: {
         totalUsers,
@@ -531,6 +692,52 @@ export class AdsService {
         closedAds,
       },
       revenue: priceAnalytics,
+      // Mobil statistika grafigi uchun (additive — eski iste'molchilarga ta'sir qilmaydi)
+      trend,
+      growthPercent,
     };
+  }
+
+  /**
+   * Foydalanuvchining oxirgi 7 kunlik e'lon yaratish faolligi.
+   * trend: har kun uchun e'lonlar soni (eskidan yangiga, 7 element).
+   * growthPercent: shu hafta vs o'tgan hafta o'sishi (%).
+   */
+  private async getAdTrend(userId: string): Promise<{ trend: number[]; growthPercent: number }> {
+    const days = 7;
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
+
+    // 14 kunlik oynani bir so'rovda olamiz (shu hafta + o'tgan hafta)
+    const windowStart = new Date(startOfToday);
+    windowStart.setDate(windowStart.getDate() - (days * 2 - 1));
+
+    const ads = await this.prisma.ad.findMany({
+      where: { userId, createdAt: { gte: windowStart } },
+      select: { createdAt: true },
+    });
+
+    const dayMs = 86400000;
+    const buckets: number[] = new Array<number>(days * 2).fill(0);
+    for (const a of ads) {
+      const d = new Date(a.createdAt);
+      d.setHours(0, 0, 0, 0);
+      const idx = Math.floor((d.getTime() - windowStart.getTime()) / dayMs);
+      if (idx >= 0 && idx < buckets.length) buckets[idx]++;
+    }
+
+    const prevWeek: number[] = buckets.slice(0, days); // o'tgan hafta
+    const thisWeek: number[] = buckets.slice(days); // shu hafta
+    const prevSum = prevWeek.reduce((s, n) => s + n, 0);
+    const thisSum = thisWeek.reduce((s, n) => s + n, 0);
+
+    let growthPercent = 0;
+    if (prevSum > 0) {
+      growthPercent = Math.round(((thisSum - prevSum) / prevSum) * 1000) / 10;
+    } else if (thisSum > 0) {
+      growthPercent = 100;
+    }
+
+    return { trend: thisWeek, growthPercent };
   }
 }

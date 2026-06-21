@@ -34,3 +34,8 @@ uploads/
 
 # Coverage
 coverage/
+
+# Firebase / service-account credentials (maxfiy)
+*firebase-adminsdk*.json
+*-adminsdk-*.json
+yolda-driver-firebase-adminsdk-fbsvc-a3c7a10869.json

@@ -39,7 +39,10 @@ export class SessionsService {
   }) {
     const where: Prisma.SessionWhereInput = {
       userId,
-      ...(params?.status && { status: params.status }),
+      // Agar aniq status berilmasa, DELETED larni chiqarmaslik
+      ...(params?.status
+        ? { status: params.status }
+        : { status: { not: SessionStatus.DELETED } }),
       ...(params?.includeFrozen === false && { isFrozen: false }),
     };
 
@@ -120,15 +123,15 @@ export class SessionsService {
    */
   async remove(id: string): Promise<Session> {
     try {
-      // Soft delete - mark as deleted
-      const session = await this.prisma.session.update({
+      // Guruhlarni o'chirish
+      await this.prisma.group.deleteMany({ where: { sessionId: id } });
+
+      // Sessionni o'chirish (hard delete)
+      const session = await this.prisma.session.delete({
         where: { id },
-        data: {
-          status: SessionStatus.DELETED,
-        },
       });
 
-      this.logger.log(`Session deleted: ${id}`);
+      this.logger.log(`Session deleted (hard): ${id}, guruhlar ham o'chirildi`);
       return session;
     } catch (error) {
       this.logger.error(`Failed to delete session: ${id}`, error);
@@ -147,10 +150,15 @@ export class SessionsService {
    * Mark session as frozen
    */
   async markFrozen(id: string, unfreezeAt?: Date): Promise<Session> {
-    return this.update(id, {
-      isFrozen: true,
-      frozenAt: new Date(),
-      unfreezeAt,
+    return this.prisma.session.update({
+      where: { id },
+      data: {
+        isFrozen: true,
+        frozenAt: new Date(),
+        unfreezeAt,
+        freezeCount: { increment: 1 },
+      },
+      include: { _count: { select: { groups: true } } },
     });
   }
 
@@ -162,6 +170,7 @@ export class SessionsService {
       isFrozen: false,
       frozenAt: null,
       unfreezeAt: null,
+      status: SessionStatus.ACTIVE,
     });
   }
 
@@ -478,7 +487,77 @@ export class SessionsService {
       },
     });
 
-    this.logger.log(`Cleaned up ${result.count} frozen sessions`);
+    this.logger.log(`Unfroze ${result.count} frozen sessions`);
     return result.count;
+  }
+
+  /**
+   * O'lik sessionlarni va ularning guruhlarini o'chirish
+   * DELETED, INACTIVE, va uzoq vaqt ishlamagan sessionlar tozalanadi
+   */
+  async cleanupDeadSessions(): Promise<{ deletedSessions: number; deletedGroups: number }> {
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - 3); // 3 kundan eski
+
+    // 1. DELETED sessionlar guruhlarini o'chirish
+    const deletedGroups1 = await this.prisma.group.deleteMany({
+      where: {
+        session: { status: 'DELETED' },
+      },
+    });
+
+    // 2. DELETED sessionlarni o'chirish
+    const deletedSessions1 = await this.prisma.session.deleteMany({
+      where: { status: 'DELETED' },
+    });
+
+    // 3. INACTIVE sessionlar (3+ kun) guruhlarini o'chirish
+    const deletedGroups2 = await this.prisma.group.deleteMany({
+      where: {
+        session: {
+          status: 'INACTIVE',
+          updatedAt: { lte: cutoffDate },
+        },
+      },
+    });
+
+    // 4. INACTIVE sessionlarni (3+ kun) o'chirish
+    const deletedSessions2 = await this.prisma.session.deleteMany({
+      where: {
+        status: 'INACTIVE',
+        updatedAt: { lte: cutoffDate },
+      },
+    });
+
+    // 5. SessionString yo'q ACTIVE sessionlarni INACTIVE ga o'tkazish
+    await this.prisma.session.updateMany({
+      where: {
+        status: 'ACTIVE',
+        sessionString: null,
+        updatedAt: { lte: cutoffDate },
+      },
+      data: { status: 'INACTIVE' },
+    });
+
+    // 6. isActive=false guruhlarni tozalash (7+ kun avval deactivate bo'lgan)
+    const weekAgo = new Date();
+    weekAgo.setDate(weekAgo.getDate() - 7);
+    const deletedInactiveGroups = await this.prisma.group.deleteMany({
+      where: {
+        isActive: false,
+        updatedAt: { lte: weekAgo },
+      },
+    });
+
+    const totalGroups = deletedGroups1.count + deletedGroups2.count + deletedInactiveGroups.count;
+    const totalSessions = deletedSessions1.count + deletedSessions2.count;
+
+    if (totalSessions > 0 || totalGroups > 0) {
+      this.logger.log(
+        `🧹 Dead cleanup: ${totalSessions} session, ${totalGroups} guruh o'chirildi`,
+      );
+    }
+
+    return { deletedSessions: totalSessions, deletedGroups: totalGroups };
   }
 }

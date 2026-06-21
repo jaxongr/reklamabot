@@ -22,8 +22,10 @@ import {
   CreditCardOutlined,
   BankOutlined,
   DollarOutlined,
+  CarOutlined,
 } from '@ant-design/icons'
 import styled from 'styled-components'
+import api from '../../services/api'
 import {
   useProfile,
   useUpdateProfile,
@@ -475,7 +477,73 @@ const Settings = () => {
           </div>
         </StyledCard>
       )}
+
+      {/* Haydovchi sinov obuna sozlamasi */}
+      <DriverTrialSettings />
     </div>
+  )
+}
+
+// ═══════ Haydovchi sinov obuna sozlamasi ═══════
+function DriverTrialSettings() {
+  const [days, setDays] = useState<number>(30)
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const { user } = useAuthStore()
+  const isAdmin = user?.role === 'SUPER_ADMIN' || user?.role === 'ADMIN'
+
+  useEffect(() => {
+    if (!isAdmin) return
+    api.get('/config/driver-trial-days')
+      .then(res => { setDays(res.data?.days ?? 30) })
+      .catch(() => {})
+      .finally(() => setLoading(false))
+  }, [isAdmin])
+
+  const handleSave = async () => {
+    setSaving(true)
+    try {
+      await api.put('/config/driver-trial-days', { days })
+      message.success(`Sinov obuna: ${days} kun saqlandi`)
+    } catch {
+      message.error('Xatolik')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  if (!isAdmin) return null
+
+  return (
+    <StyledCard
+      title={<><CarOutlined /> Haydovchi sinov obuna</>}
+      style={{ marginTop: 24 }}
+      loading={loading}
+    >
+      <Row gutter={16} align="middle">
+        <Col>
+          <Text>Yangi haydovchi ro'yxatdan o'tganda avtomatik bepul obuna:</Text>
+        </Col>
+        <Col>
+          <InputNumber
+            min={0}
+            max={365}
+            value={days}
+            onChange={v => setDays(v || 0)}
+            addonAfter="kun"
+            style={{ width: 140 }}
+          />
+        </Col>
+        <Col>
+          <Button type="primary" icon={<SaveOutlined />} onClick={handleSave} loading={saving}>
+            Saqlash
+          </Button>
+        </Col>
+        <Col>
+          <Text type="secondary">0 = sinov obuna o'chirilgan</Text>
+        </Col>
+      </Row>
+    </StyledCard>
   )
 }
 

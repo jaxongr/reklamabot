@@ -139,4 +139,22 @@ export class SchedulerService implements OnModuleInit {
       this.logger.error('Frozen session cleanup failed:', error);
     }
   }
+
+  /**
+   * O'lik sessionlar va guruhlarni tozalash — har 6 soatda
+   * DELETED, INACTIVE sessionlar + ularning guruhlari o'chiriladi
+   */
+  @Cron('0 */6 * * *')
+  async handleDeadSessionCleanup() {
+    try {
+      const result = await this.sessionsService.cleanupDeadSessions();
+      if (result.deletedSessions > 0 || result.deletedGroups > 0) {
+        this.logger.log(
+          `🧹 Dead session cleanup: ${result.deletedSessions} sessions, ${result.deletedGroups} groups removed`,
+        );
+      }
+    } catch (error) {
+      this.logger.error('Dead session cleanup failed:', error);
+    }
+  }
 }
